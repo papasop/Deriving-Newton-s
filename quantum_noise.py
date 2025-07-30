@@ -11,7 +11,7 @@ L_M = 0.063826
 
 # === 网格定义 ===
 x = np.linspace(150, 250, 300)  # 平衡速度
-t = np.linspace(4.7, 5.7, 100)  # 增加 t 点数修复精度问题
+t = np.linspace(4.7, 5.7, 100)  # 修复精度
 dx = x[1] - x[0]
 dt = t[1] - t[0]
 
@@ -74,26 +74,39 @@ base = dict(
 )
 
 # === 蒙特卡罗测试 ===
-num_simulations = 10  # 适合 Colab
-quantum_noise_levels = [0.0, 1e-2, 0.1, 1.0, 10.0, 100.0, 1000.0]
+num_simulations = 10
+quantum_noise_levels = [0.0, 1e-2, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0]  # 添加更高噪声
 
 print("=== G(t*) 量子统一模拟测试（蒙特卡罗多组运行） ===")
 for noise_level in quantum_noise_levels:
     G_values = []
     rel_errors = []
+    K_t_values = []  # 收集 K(t)
+    K_at_tstar = []  # 收集 K(t*)
     print(f"\n--- 量子噪声水平: {noise_level * h_bar:.2e} ---")
     for _ in range(num_simulations):
         G_best, res = compute_G(**base, quantum_noise=noise_level)
         if res is not None:
             G_values.append(res['G'])
             rel_errors.append(res['rel_error'])
+            K_t_values.append(res['K_t'])
+            K_at_tstar.append(res['K'])
     if G_values:
         avg_G = np.mean(G_values)
         avg_error = np.mean(rel_errors)
         std_G = np.std(G_values)
+        avg_K_at_tstar = np.mean(K_at_tstar)
+        std_K_at_tstar = np.std(K_at_tstar)
+        avg_K_t = np.mean(K_t_values, axis=0)
+        std_K_t = np.std(K_t_values, axis=0)
+        t0_idx = np.argmin(np.abs(t - base['t0']))
         print(f"平均 G(t*) = {avg_G:.6e}")
         print(f"平均相对误差 = {avg_error:.4f}%")
         print(f"G 标准差 = {std_G:.6e}（量子波动影响）")
+        print(f"平均 K(t*) = {avg_K_at_tstar:.6e}")
+        print(f"K(t*) 标准差 = {std_K_at_tstar:.6e}")
+        print(f"平均 K(t) 样本（t0附近10个时间点, t[{t0_idx-5}:{t0_idx+5}]）: {avg_K_t[t0_idx-5:t0_idx+5]}")
+        print(f"K(t) 标准差（t0附近10个时间点）: {std_K_t[t0_idx-5:t0_idx+5]}")
         print(f"参考 G_CODATA = {G_CODATA:.6e}")
 
-print("运行说明: 修复 t=100 点数, sigma_t=0.35, phi2=7.8e-30, g_star=0.5, 测试高噪声1000。预期误差0.2%。")
+print("运行说明: Colab 版本, 添加 K(t) 输出, sigma_t=0.35, phi2=7.8e-30, g_star=0.5, 测试高噪声10000。预期 K(t*) ~2.0, std ~10^{-7}。")
