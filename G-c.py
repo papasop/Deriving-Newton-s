@@ -1,377 +1,334 @@
-# Improved Colab-ready script with redesigned zeta-phase prior and SCI framework: verify unified field equation AND invert for c given Newton's G
-# Additions:
-# - SCI framework: compute K_w from unfolded zero gaps {τn} of zeta zeros (hard-coded first 100 zeros from known data).
-# - Compute K_w for Riemann, GUE, Poisson controls, and perform KS tests (p < 10^-5 for Riemann vs controls).
-# - Redesigned zeta: k_vec = [5.0, 5.0, 5.0], t_samples=5000.
-# - Random control: use_control=True for comparison (higher relClose expected).
-# - Retained spectral FFT, font fix, optimized shells.
-# - Note: Hard-coded zeros for reproducibility; in practice, use more zeros for W_min >=50 windows.
-import os
+# ================== One-Click Colab: Abell 2744 (CATS v4) — Σ-form & κ-form (comp+DC) ==================
+# 如遇 import 报错，可解除下一行安装（Colab 通常已自带）
+# !pip -q install astropy scipy numpy matplotlib
+
+import os, math, pathlib, urllib.request
 import numpy as np
-import pandas as pd
+import numpy.fft as nft
 import matplotlib.pyplot as plt
-from numpy.fft import fftn, ifftn, fftfreq
-import mpmath
-from scipy.interpolate import interp1d
-from scipy.stats import ks_2samp
-# Fix Matplotlib font for Glyph warnings (e.g., NABLA symbol)
-plt.rcParams['font.family'] = 'DejaVu Sans'
-# -----------------------
-# Parameters
-# -----------------------
-N = 64 # grid size per axis (64^3 ~ 262k voxels; for zeta, keep small or optimize)
-L = 1.0 # domain edge length (dimensionless box)
-dx = L / N
-use_SI = True # True: use SI constants; False: dimensionless demo
-c_km_per_s = 299792.458 # try 280000.0 to test your "28万 km/s" variant
-G_true = 6.67430e-11 # Newton's G (m^3 kg^-1 s^-2); used to forward-simulate & for inversion
-g_gain = 0.5 # coupling g in ln n = g (phi_zeta - <phi_zeta>)
-use_zeta = True # True: use zeta-phase prior to generate ln_n and predict rho_pred; False: use Poisson from rho
-use_control = False # If True and use_zeta=True, use random phase control instead of zeta for comparison
-# Zeta parameters (affine map U(x) = k · x + b; redesigned k_vec for multi-directional structure)
-k_vec = np.array([5.0, 5.0, 5.0]) # Redesigned: multi-directional for richer phase field
-b = 0.0 # Offset
-t_samples = 5000 # Redesigned: increased for denser, more accurate nu(t) sampling
-# SCI parameters
-w = 40 # Window length
-Delta = 1 # Stride
-# Hard-coded first 100 imaginary parts of non-trivial zeros (γn) from known data (e.g., plouffe.fr)
-gamma_n = np.array([14.134725, 21.022040, 25.010858, 30.424876, 32.935062, 37.586178, 40.918719, 43.327073, 48.005151, 49.773832, 52.970321, 56.446248, 59.347044, 60.831782, 65.112544, 67.079811, 69.546401, 72.067158, 75.704690, 77.144841, 79.337375, 82.910380, 84.735492, 87.425274, 88.809111, 92.491899, 94.651344, 95.870634, 98.831194, 101.317851, 103.725538, 105.446623, 107.168678, 111.029537, 111.874659, 114.320220, 116.226681, 118.790782, 121.370125, 122.946829, 124.256818, 127.516683, 129.578704, 131.087719, 133.497726, 134.756681, 138.116012, 139.736192, 141.123707, 143.111845, 146.000982, 147.422680, 150.053520, 150.925257, 153.024674, 156.112909, 157.597487, 158.849983, 161.188964, 163.030709, 165.537121, 167.184436, 169.094496, 169.911976, 173.411468, 174.754188, 176.441434, 178.377492, 179.916509, 182.207056, 184.874498, 185.598784, 187.228911, 189.416236, 192.026661, 193.079673, 195.265392, 196.876499, 198.015309, 201.264751, 202.493629, 204.189671, 205.394684, 207.906251, 209.576509, 211.690907, 213.347855, 214.547005, 216.169468, 219.067001, 220.714854, 221.430709, 224.007002, 224.983324])
-if use_SI:
-    c = c_km_per_s * 1000.0 # m/s
+from numpy import trapezoid
+from scipy.ndimage import gaussian_filter, map_coordinates
+
+from astropy.io import fits
+from astropy.wcs import WCS
+from astropy import units as u
+from astropy.constants import G, c
+from astropy.cosmology import Planck18 as cosmo
+
+import pandas as pd
+
+# -------------------- 参数（可调） --------------------
+# 数据与保存目录
+URL_FITS  = "https://archive.stsci.edu/pub/hlsp/frontier/abell2744/models/cats/v4/hlsp_frontier_model_abell2744_cats_v4_kappa.fits"
+FITS_PATH = "/content/hlsp_frontier_model_abell2744_cats_v4_kappa.fits"
+OUT_DIR   = "/content/out"
+
+# 几何（Abell 2744 常用）
+z_d = 0.308       # 簇红移
+z_s = 2.0         # 源红移（可替换为具体像系或加权有效 redshift）
+
+# 数值与证书参数（两口径共用）
+use_smoothing   = True
+sigma_pix       = 1.5     # 高斯平滑 σ（像素）
+apod_frac       = 0.10    # 加窗宽度（0.04~0.12）
+ring_count      = 24      # 同心环数
+ring_inner_frac = 0.10    # 相对 min(nx,ny)
+ring_outer_frac = 0.35
+M_samples       = 4096    # 圆周采样点数
+
+# κ-口径的环形背景厚度与盘/环间隙（补偿）
+bg_annulus_frac = 0.08    # 背景环厚度（相对 min(nx,ny)；可 0.05~0.10）
+gap_frac        = 0.01    # 盘与背景环之间的缝隙
+win_thr         = 1e-3    # 仅在 win>阈值 的像素参与 κ 背景估计/面积积分
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# -------------------- 工具函数 --------------------
+def apodize(shape, frac=0.06):
+    ny, nx = shape
+    win = np.ones((ny, nx), dtype=np.float64)
+    ax = int(nx*frac); ay = int(ny*frac)
+    if ax>0:
+        wx = 0.5*(1-np.cos(np.linspace(0,np.pi,ax)))
+        for i in range(ax):
+            win[:, i]    *= wx[i]
+            win[:, -i-1] *= wx[i]
+    if ay>0:
+        wy = 0.5*(1-np.cos(np.linspace(0,np.pi,ay)))
+        for j in range(ay):
+            win[j, :]    *= wy[j]
+            win[-j-1, :] *= wy[j]
+    return win
+
+def solve_poisson_2d(Rw, pix_rad):
+    """解 ∇^2 φ = Rw （2D, FFT，DC=0 规约）"""
+    ny, nx = Rw.shape
+    kx = nft.fftfreq(nx, d=pix_rad) * 2*np.pi
+    ky = nft.fftfreq(ny, d=pix_rad) * 2*np.pi
+    KX, KY = np.meshgrid(kx, ky, indexing='xy')
+    k2 = KX**2 + KY**2
+    Rk = nft.fft2(Rw)
+    Phi_k = np.zeros_like(Rk, dtype=np.complex128)
+    mask = (k2 > 0)
+    Phi_k[mask] = Rk[mask] / (-k2[mask])     # DC=0 规约
+    Phi = nft.ifft2(Phi_k).real
+    LapPhi = nft.ifft2(-k2 * nft.fft2(Phi)).real
+    return Phi, Phi_k, LapPhi, (KX, KY, k2)
+
+def ring_integral_normal(Phi_k, grids, Rpix, pix_rad, M_samples=4096):
+    """外法向线积分 F_line = ∮ ∇φ·n̂ dl"""
+    KX, KY, _ = grids
+    ny, nx = Phi_k.shape
+    cy, cx = (ny-1)/2.0, (nx-1)/2.0
+    ang = np.linspace(0, 2*np.pi, M_samples, endpoint=False)
+    xx = cx + Rpix*np.cos(ang)
+    yy = cy + Rpix*np.sin(ang)
+    nxu, nyu = np.cos(ang), np.sin(ang)      # 外法向
+    dphidx = nft.ifft2((1j*KX)*Phi_k).real
+    dphidy = nft.ifft2((1j*KY)*Phi_k).real
+    gx = map_coordinates(dphidx, [yy, xx], order=3, mode='nearest')
+    gy = map_coordinates(dphidy, [yy, xx], order=3, mode='nearest')
+    grad_n = gx*nxu + gy*nyu
+    return trapezoid(grad_n, ang) * (Rpix*pix_rad)
+
+def disk_mask(ny, nx, Rpix):
+    cy, cx = (ny-1)/2.0, (nx-1)/2.0
+    YY, XX = np.indices((ny, nx))
+    rr = np.hypot(YY - cy, XX - cx)
+    return (rr <= Rpix), rr, (YY,XX), (cy,cx)
+
+def save_summary(prefix, summary_dict, per_ring_dict, out_dir=OUT_DIR):
+    summ = pd.DataFrame({"Metric": list(summary_dict.keys()), "Value": list(summary_dict.values())})
+    pr   = pd.DataFrame(per_ring_dict)
+    sp   = os.path.join(out_dir, f"{prefix}_summary.csv")
+    prp  = os.path.join(out_dir, f"{prefix}_per_ring.csv")
+    summ.to_csv(sp, index=False); pr.to_csv(prp, index=False)
+    print("Saved CSV:", sp)
+    print("Saved per-ring CSV:", prp)
+
+# -------------------- 下载并读取 κ-FITS --------------------
+if not pathlib.Path(FITS_PATH).exists():
+    print("Downloading:", URL_FITS)
+    urllib.request.urlretrieve(URL_FITS, FITS_PATH)
 else:
-    c = 1.0
-    G_true = 1.0e-2
-# -----------------------
-# Build ρ(x): two Gaussians; zero-mean for periodic Poisson (used when use_zeta=False)
-# -----------------------
-x = (np.arange(N) + 0.5) * dx - L/2
-X, Y, Z = np.meshgrid(x, x, x, indexing='ij')
-def gaussian3d(X, Y, Z, cx, cy, cz, sigma):
-    r2 = (X-cx)**2 + (Y-cy)**2 + (Z-cz)**2
-    return np.exp(-0.5 * r2 / sigma**2)
-rho = 2.0 * gaussian3d(X, Y, Z, -0.15, -0.10, 0.05, 0.10) \
-    - 1.2 * gaussian3d(X, Y, Z, 0.20, 0.05, -0.15, 0.12)
-rho -= rho.mean()
-# -----------------------
-# Zeta-phase prior generation (if use_zeta=True)
-# -----------------------
-if use_zeta:
-    # Affine map U(x) = k · x + b
-    U = k_vec[0]*X + k_vec[1]*Y + k_vec[2]*Z + b
-    t_min, t_max = np.min(U), np.max(U)
-   
-    if not use_control:
-        # Redesigned zeta phase: precompute nu(t) = unwrap(arg(zeta(1/2 + it))) on denser 1D grid
-        t_1d = np.linspace(t_min, t_max, t_samples)
-        nu_1d = []
-        for ti in t_1d:
-            s = mpmath.mpc(0.5, ti)
-            z = mpmath.zeta(s)
-            arg = float(mpmath.arg(z))
-            nu_1d.append(arg)
-        nu_1d = np.array(nu_1d)
-        nu_1d = np.unwrap(nu_1d) # Unwrap phase
-       
-        # Interpolate for 3D U
-        interp_nu = interp1d(t_1d, nu_1d, kind='linear', fill_value='extrapolate')
-        nu = interp_nu(U)
-       
-        # phi_zeta = cos(nu(U(x)))
-        phi_zeta = np.cos(nu)
-    else:
-        # Random phase control for comparison
-        random_phase = np.random.uniform(0, 2 * np.pi, size=U.shape)
-        phi_zeta = np.cos(random_phase)
-   
-    # ln n_zeta = g (phi_zeta - <phi_zeta>)
-    ln_n = g_gain * (phi_zeta - np.mean(phi_zeta))
-    n = np.exp(ln_n)
-   
-    # Predict rho_pred from unified eq: rho_pred = - (c^2 / (8 pi G)) lap ln_n
-    kappa = 8.0 * np.pi * G_true / c**2
-    lhs = laplacian_fft(ln_n) # ∇² ln n
-    rho_pred = - lhs / kappa
-    rhs = - kappa * rho_pred # For closure: rhs based on rho_pred
-    residual = lhs - rhs
-    rho_used = rho_pred # Use rho_pred for flux/M_V in closures
+    print("File exists:", FITS_PATH)
+
+hdul = fits.open(FITS_PATH)
+kappa = hdul[0].data.astype(np.float64)
+hdr   = hdul[0].header
+wcs   = WCS(hdr)
+ny, nx = kappa.shape
+deg2rad = np.pi/180.0
+
+# 像素弧度尺度
+if all(k in hdr for k in ("CD1_1","CD1_2","CD2_1","CD2_2")):
+    CD = np.array([[hdr["CD1_1"], hdr["CD1_2"]],[hdr["CD2_1"], hdr["CD2_2"]]])
+    sx = math.hypot(CD[0,0], CD[1,0])  # deg/pix
+    sy = math.hypot(CD[0,1], CD[1,1])  # deg/pix
+    pix_rad = math.sqrt(sx*sy) * deg2rad
+elif all(k in hdr for k in ("CDELT1","CDELT2")):
+    pix_rad = np.mean([abs(hdr["CDELT1"]), abs(hdr["CDELT2"])]) * deg2rad
 else:
-    # Poisson solve: ∇² φ = -(8π G / (c² g)) ρ (periodic via FFT)
-    A = 8.0 * np.pi * G_true / (c**2 * g_gain)
-    kx = 2.0 * np.pi * fftfreq(N, d=dx)
-    ky = 2.0 * np.pi * fftfreq(N, d=dx)
-    kz = 2.0 * np.pi * fftfreq(N, d=dx)[:N//2+1] # for rfftn along last axis
-    KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing='ij')
-    k2 = KX**2 + KY**2 + KZ**2
-    rho_k = rfftn(rho)
-    phi_k = np.zeros_like(rho_k, dtype=np.complex128)
-    mask = k2 != 0.0
-    phi_k[mask] = (A * rho_k[mask]) / k2[mask] # -k² φ_k = -A ρ_k ⇒ φ_k = A ρ_k / k²
-    phi = irfftn(phi_k, axes=(0, 1, 2))
-   
-    # ln n = g φ
-    ln_n = g_gain * phi
-    n = np.exp(ln_n)
-   
-    kappa = 8.0 * np.pi * G_true / c**2
-    lhs = laplacian_fft(ln_n) # ∇² ln n
-    rhs = - kappa * rho # -(8πG/c²) ρ
-    residual = lhs - rhs
-    rho_used = rho # Use original rho for closures
-# -----------------------
-# Spectral Laplacian with DC correction (as per paper)
-# -----------------------
-def laplacian_fft(f):
-    kx_full = 2.0 * np.pi * fftfreq(N, d=dx)
-    ky_full = 2.0 * np.pi * fftfreq(N, d=dx)
-    kz_full = 2.0 * np.pi * fftfreq(N, d=dx)
-    KX_full, KY_full, KZ_full = np.meshgrid(kx_full, ky_full, kz_full, indexing='ij')
-    k2_full = KX_full**2 + KY_full**2 + KZ_full**2
-    f_k = fftn(f)
-    lap_k = -k2_full * f_k
-    lap = np.real(ifftn(lap_k))
-    lap -= np.mean(lap) # DC correction: enforce <lap> = 0 for periodic box
-    return lap
-# -----------------------
-# SCI Framework Implementation
-# -----------------------
-# Unfolded zero gaps τn = (γ_{n+1} - γ_n) / mean(Δγ)
-delta_gamma = np.diff(gamma_n)
-mean_delta_gamma = np.mean(delta_gamma)
-tau_n = delta_gamma / mean_delta_gamma
-# Compute K_w for Riemann
-Kw_riemann = []
-num_windows = 0
-for j in range(0, len(tau_n) - w + 1, Delta):
-    Wj = tau_n[j:j+w]
-    Phi_w = np.mean(Wj)
-    Hw = np.var(Wj, ddof=0)
-    Kw_riemann.append(Phi_w / (Hw + 1e-30))
-    num_windows += 1
-print(f"SCI: Number of windows = {num_windows}")
-# GUE control (approximate Wigner surmise spacing: p(s) = (π s / 2) exp(-π s^2 / 4))
-tau_gue = np.sort(np.random.normal(0, 1, len(delta_gamma))**2) # Simplified approximation for GUE spacing
-tau_gue /= np.mean(tau_gue)
-Kw_gue = []
-for j in range(0, len(tau_gue) - w + 1, Delta):
-    Wj = tau_gue[j:j+w]
-    Phi_w = np.mean(Wj)
-    Hw = np.var(Wj, ddof=0)
-    Kw_gue.append(Phi_w / (Hw + 1e-30))
-# Poisson control (exponential spacing)
-tau_poisson = -np.log(np.random.uniform(0, 1, len(delta_gamma)))
-tau_poisson /= np.mean(tau_poisson)
-Kw_poisson = []
-for j in range(0, len(tau_poisson) - w + 1, Delta):
-    Wj = tau_poisson[j:j+w]
-    Phi_w = np.mean(Wj)
-    Hw = np.var(Wj, ddof=0)
-    Kw_poisson.append(Phi_w / (Hw + 1e-30))
-# KS tests
-D_rg, p_rg = ks_2samp(Kw_riemann, Kw_gue)
-D_rp, p_rp = ks_2samp(Kw_riemann, Kw_poisson)
-D_gp, p_gp = ks_2samp(Kw_gue, Kw_poisson)
-print(f"SCI KS Riemann vs GUE: D={D_rg:.4f}, p={p_rg:.4e}")
-print(f"SCI KS Riemann vs Poisson: D={D_rp:.4f}, p={p_rp:.4e}")
-print(f"SCI KS GUE vs Poisson: D={D_gp:.4f}, p={p_gp:.4e}")
-# -----------------------
-# Metrics & G estimates (known c)
-# -----------------------
-def mae(x): return np.mean(np.abs(x))
-def rmse(x): return np.sqrt(np.mean(x**2))
-rel_L2 = np.linalg.norm(residual.ravel()) / (np.linalg.norm(rhs.ravel()) + 1e-30)
-mae_res = mae(residual)
-rmse_res = rmse(residual)
-corr = np.corrcoef(lhs.ravel(), rhs.ravel())[0,1]
-# Pointwise G
-eps_rho = 1e-6 * np.max(np.abs(rho_used))
-mask_rho = np.abs(rho_used) > eps_rho
-G_est = np.full_like(rho_used, np.nan, dtype=np.float64)
-G_est[mask_rho] = -(c**2 / (8.0*np.pi)) * lhs[mask_rho] / rho_used[mask_rho]
-def robust_stats(a, ref):
-    a = a[np.isfinite(a)]
-    med = np.median(a)
-    q1, q3 = np.percentile(a, [25, 75])
-    iqr = q3 - q1
-    mape = np.median(np.abs((a - ref) / (ref + 1e-30))) * 100.0
-    return med, q1, q3, iqr, mape
-G_med, G_q1, G_q3, G_iqr, G_mape = robust_stats(G_est[mask_rho], G_true)
-# Spectral gradient for flux
-def grad_fft(f):
-    kx_full = 2.0 * np.pi * fftfreq(N, d=dx)
-    ky_full = 2.0 * np.pi * fftfreq(N, d=dx)
-    kz_full = 2.0 * np.pi * fftfreq(N, d=dx)
-    KX_full, KY_full, KZ_full = np.meshgrid(kx_full, ky_full, kz_full, indexing='ij')
-    f_k = fftn(f)
-    gx = np.real(ifftn(1j * KX_full * f_k))
-    gy = np.real(ifftn(1j * KY_full * f_k))
-    gz = np.real(ifftn(1j * KZ_full * f_k))
-    return gx, gy, gz
-gx, gy, gz = grad_fft(ln_n)
-# Flux G (Gauss) over centered half-box
-sub = slice(N//4, 3*N//4)
-def surface_flux_ln_n(sub, gx, gy, gz, dx):
-    i0, i1 = sub.start, sub.stop-1
-    j0, j1 = sub.start, sub.stop-1
-    k0, k1 = sub.start, sub.stop-1
-    dS = dx*dx
-    flux = 0.0
-    flux += np.sum((-gx[i0, sub, sub]) * dS) + np.sum((+gx[i1, sub, sub]) * dS)
-    flux += np.sum((-gy[sub, j0, sub]) * dS) + np.sum((+gy[sub, j1, sub]) * dS)
-    flux += np.sum((-gz[sub, sub, k0]) * dS) + np.sum((+gz[sub, sub, k1]) * dS)
-    return flux
-flux = surface_flux_ln_n(sub, gx, gy, gz, dx)
-M_V = np.sum(rho_used[sub, sub, sub]) * (dx**3)
-G_flux = - (c**2 / (8.0*np.pi)) * (flux / (M_V + 1e-30))
-# -----------------------
-# Multi-shell Gauss closures: relClose(Vj) - Optimized shell selection
-# -----------------------
-center = N // 2
-r_list = np.arange(8, center, 8)  # Larger steps for more stable shells: 8,16,24,...
-relClose_list = []
-for r in r_list:
-    sub_j = slice(center - r, center + r)
-    flux_j = surface_flux_ln_n(sub_j, gx, gy, gz, dx)
-    M_j = np.sum(rho_used[sub_j, sub_j, sub_j]) * (dx**3)
-    num = abs(flux_j + kappa * M_j)
-    den = abs(flux_j) + 1e-30
-    relClose_j = num / den
-    relClose_list.append(relClose_j)
-relClose_array = np.array(relClose_list)
-relClose_med = np.median(relClose_array)
-relClose_mean = np.mean(relClose_array)
-relClose_q1, relClose_q3 = np.percentile(relClose_array, [25, 75])
-relClose_iqr = relClose_q3 - relClose_q1
-# Convert to percent for reporting
-relClose_med_pct = relClose_med * 100.0
-relClose_mean_pct = relClose_mean * 100.0
-relClose_q1_pct = relClose_q1 * 100.0
-relClose_q3_pct = relClose_q3 * 100.0
-relClose_iqr_pct = relClose_iqr * 100.0
-# -----------------------
-# Invert for c given G (pointwise & flux)
-# -----------------------
-# Pointwise: c_est(x) = sqrt( -8π G ρ / (∇² ln n) )
-eps_lhs = 1e-8 * np.max(np.abs(lhs))
-ratio = -8.0 * np.pi * G_true * rho_used / (lhs + 1e-300)
-mask_c = (np.abs(rho_used) > eps_rho) & (np.abs(lhs) > eps_lhs) & (ratio > 0) & np.isfinite(ratio)
-c_est_point = np.full_like(rho_used, np.nan, dtype=np.float64)
-c_est_point[mask_c] = np.sqrt(ratio[mask_c])
-c_med, c_q1, c_q3, c_iqr, c_mape = robust_stats(c_est_point[mask_c], c)
-# Flux: c_est = sqrt( -8π G M(V) / flux )
-c_flux = np.sqrt(np.maximum(1e-300, -8.0*np.pi * G_true * M_V / (flux + 1e-300)))
-# -----------------------
-# Summary table (both directions + relClose stats)
-# -----------------------
-summary = pd.DataFrame({
-    "Metric": [
-        "Rel L2 ||LHS-RHS|| / ||RHS||",
-        "MAE(residual)",
-        "RMSE(residual)",
-        "Corr(LHS, RHS)",
-        "c_used (m/s)",
-        "G_true",
-        "G_est_median",
-        "G_est_q1",
-        "G_est_q3",
-        "G_est_IQR",
-        "G_est_median_APE(%)",
-        "G_flux_est",
-        "c_est_point_median (m/s)",
-        "c_est_point_q1",
-        "c_est_point_q3",
-        "c_est_point_IQR",
-        "c_est_point_median_APE(%)",
-        "c_est_flux (m/s)",
-        "relClose_median (%)",
-        "relClose_mean (%)",
-        "relClose_q1 (%)",
-        "relClose_q3 (%)",
-        "relClose_IQR (%)"
-    ],
-    "Value": [
-        rel_L2,
-        mae_res,
-        rmse_res,
-        corr,
-        c,
-        G_true,
-        G_med,
-        G_q1,
-        G_q3,
-        G_iqr,
-        G_mape,
-        G_flux,
-        c_med,
-        c_q1,
-        c_q3,
-        c_iqr,
-        c_mape,
-        c_flux,
-        relClose_med_pct,
-        relClose_mean_pct,
-        relClose_q1_pct,
-        relClose_q3_pct,
-        relClose_iqr_pct
-    ]
-})
-SAVE_DIR = "/content" if os.path.isdir("/content") else os.getcwd()
-csv_path = os.path.join(SAVE_DIR, "unified_field_bidir_colab_zeta_redesigned_sci.csv")
-summary.to_csv(csv_path, index=False)
-print(summary)  # Print the summary table for viewing
-# -----------------------
-# Plots
-# -----------------------
-# 1) Histogram of pointwise G estimates
-plt.figure(figsize=(6,4))
-plt.hist(G_est[mask_rho].ravel(), bins=80)
-plt.title("Histogram of pointwise G estimates")
-plt.xlabel("G_est"); plt.ylabel("Count")
+    raise RuntimeError("No CD/CDELT in FITS header.")
+
+print(f"FITS path: {FITS_PATH}")
+print(f"kappa shape: {kappa.shape}")
+print(f"Pixel scale ≈ {pix_rad/deg2rad*3600:.3f} arcsec/pix")
+
+# 加窗
+win = apodize(kappa.shape, frac=apod_frac)
+valid = (win > 1e-3)
+
+# ==================== Σ-form（原始 & DC-consistent） ====================
+print("\n=== Σ-form ===")
+Dd  = cosmo.angular_diameter_distance(z_d).to(u.m)
+Ds  = cosmo.angular_diameter_distance(z_s).to(u.m)
+Dds = cosmo.angular_diameter_distance_z1z2(z_d, z_s).to(u.m)
+Sigma_crit = (c**2/(4*np.pi*G) * (Ds/(Dd*Dds))).to(u.kg/(u.m*u.m)).value
+print("Σcrit [kg/m^2]:", f"{Sigma_crit:.3e}")
+
+Sigma   = kappa * Sigma_crit
+Sigma_s = gaussian_filter(Sigma, sigma=sigma_pix) if use_smoothing else Sigma
+k_th    = -(8*np.pi*G.value/c.value**2)
+
+# ---- 原始（与求解使用同一 RHS = Σ_s * win） ----
+Rw_sigma = k_th * Sigma_s * win
+Phi_n, Phi_n_k, LapPhi_n, grids_n = solve_poisson_2d(Rw_sigma, pix_rad)
+
+lhs_sigma = LapPhi_n[valid]; rhs_sigma = Rw_sigma[valid]
+relL2_sigma = np.linalg.norm(lhs_sigma - rhs_sigma) / (np.linalg.norm(rhs_sigma) + 1e-30)
+corr_sigma  = np.corrcoef(lhs_sigma, rhs_sigma)[0,1]
+print(f"[Σ] Pixel closure  Rel-L2 = {relL2_sigma:.3e}   Corr = {corr_sigma:.6f}")
+
+Rpix_min = int(min(nx,ny) * ring_inner_frac)
+Rpix_max = int(min(nx,ny) * ring_outer_frac)
+radii    = np.linspace(Rpix_min, Rpix_max, ring_count)
+
+Fs_sigma, Ms_sigma, rels_sigma, Fvols_sigma = [], [], [], []
+for Rpix in radii:
+    F_line = ring_integral_normal(Phi_n_k, grids_n, Rpix, pix_rad, M_samples)
+    inside, _, _, _ = disk_mask(ny, nx, Rpix)
+    dΩ = pix_rad**2
+    Marea = (Sigma_s[inside] * dΩ).sum()                   # 面积端用 Σ_s（标准）
+    F_vol = (LapPhi_n[inside] * dΩ).sum()                  # 体积分核验
+    rel_close = np.abs(F_line + k_th*Marea) / (np.abs(F_line)+1e-30)
+    Fs_sigma.append(F_line); Ms_sigma.append(Marea); rels_sigma.append(rel_close); Fvols_sigma.append(F_vol)
+
+Fs_sigma, Ms_sigma, rels_sigma, Fvols_sigma = map(np.array, (Fs_sigma, Ms_sigma, rels_sigma, Fvols_sigma))
+rels_sigma_pct = 100*rels_sigma
+q1s, q3s = np.percentile(rels_sigma_pct, [25,75])
+k_ls     = -np.sum(Fs_sigma*Ms_sigma) / (np.sum(Ms_sigma**2) + 1e-30)
+ratio_k  = k_ls / k_th if k_th != 0 else np.nan
+rel_diffs_sigma = np.abs(Fs_sigma - Fvols_sigma) / (np.abs(Fs_sigma)+1e-30)
+
+sigma_summary = {
+    "Rel-L2": relL2_sigma, "Corr(LHS,RHS)": corr_sigma,
+    "Gauss_median(%)": np.median(rels_sigma_pct), "Gauss_q1(%)": q1s, "Gauss_q3(%)": q3s, "Gauss_IQR(%)": q3s-q1s,
+    "k_LS": k_ls, "k_theory": k_th, "k_ratio": ratio_k,
+    "Flux_line_vs_vol_medianΔ(%)": 100*np.median(rel_diffs_sigma), "Flux_line_vs_vol_maxΔ(%)": 100*np.max(rel_diffs_sigma)
+}
+sigma_per_ring = {"Rpix": radii, "rel_close_%": rels_sigma_pct, "F_line": Fs_sigma, "F_vol": Fvols_sigma, "Marea": Ms_sigma}
+save_summary("abell2744_sigma", sigma_summary, sigma_per_ring, OUT_DIR)
+
+# ---- DC-consistent（面积端减去与 FFT 去除相同的 DC 常数）----
+Sigma_eff   = Sigma_s * win
+Rbar_sigma  = Rw_sigma.mean()            # FFT 解去掉的 DC
+Sigma0_dc   = - Rbar_sigma / k_th        # 对应面密度常数
+
+Fs_dc, Ms_dc, rels_dc = [], [], []
+for Rpix in radii:
+    F_line = ring_integral_normal(Phi_n_k, grids_n, Rpix, pix_rad, M_samples)
+    inside, _, _, _ = disk_mask(ny, nx, Rpix)
+    dΩ = pix_rad**2
+    M_comp = ((Sigma_eff[inside] - Sigma0_dc) * dΩ).sum()
+    rel_close = np.abs(F_line + k_th*M_comp) / (np.abs(F_line)+1e-30)
+    Fs_dc.append(F_line); Ms_dc.append(M_comp); rels_dc.append(rel_close)
+
+rels_sigma_dc_pct = 100*np.array(rels_dc)
+q1sd, q3sd = np.percentile(rels_sigma_dc_pct, [25,75])
+k_ls_dc    = -np.sum(np.array(Fs_dc)*np.array(Ms_dc)) / (np.sum(np.array(Ms_dc)**2)+1e-30)
+ratio_k_dc = k_ls_dc / k_th
+
+sigma_dc_summary = {
+    "Gauss_median(%)": np.median(rels_sigma_dc_pct), "Gauss_q1(%)": q1sd, "Gauss_q3(%)": q3sd, "Gauss_IQR(%)": q3sd-q1sd,
+    "k_LS(DC)": k_ls_dc, "k_theory": k_th, "k_ratio(DC)": ratio_k_dc
+}
+sigma_dc_ring = {"Rpix": radii, "rel_close_DC_%": rels_sigma_dc_pct, "F_line": Fs_dc, "Marea_comp(DC)": Ms_dc}
+save_summary("abell2744_sigma_DC", sigma_dc_summary, sigma_dc_ring, OUT_DIR)
+
+# 图（Σ）
+fig, axs = plt.subplots(1, 3, figsize=(15,5))
+im0 = axs[0].imshow(kappa, origin='lower'); axs[0].set_title("κ (convergence)")
+im1 = axs[1].imshow(Phi_n, origin='lower'); axs[1].set_title("Φ_n (Σ-form)")
+im2 = axs[2].imshow((LapPhi_n - Rw_sigma), origin='lower'); axs[2].set_title("Residual: ∇²Φ_n - Rw")
+plt.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.02)
+plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.02)
+plt.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.02)
 plt.tight_layout()
-plt.show()
-# 2) Histogram of pointwise c estimates
-plt.figure(figsize=(6,4))
-plt.hist(c_est_point[mask_c].ravel(), bins=80)
-plt.title("Histogram of pointwise c estimates")
-plt.xlabel("c_est (m/s)"); plt.ylabel("Count")
+png_sigma = os.path.join(OUT_DIR, "abell2744_sigma.png")
+plt.savefig(png_sigma, dpi=150); plt.show()
+print("Saved Figure:", png_sigma)
+
+# ==================== κ-form（补偿 + 窗一致 & DC-consistent） ====================
+print("\n=== κ-form (compensated, window-consistent) ===")
+kappa_s   = gaussian_filter(kappa, sigma=sigma_pix) if use_smoothing else kappa
+kappa_eff = kappa_s * win        # 与求解/面积/背景估计保持同一口径
+R_kappa_w = 2.0 * kappa_eff
+
+# 解 ∇^2 ψ = R_kappa_w
+Psi, Psi_k, LapPsi, grids_k = solve_poisson_2d(R_kappa_w, pix_rad)
+
+# 像素级闭合（与 R_kappa_w 一致）
+lhs_k = LapPsi[valid]; rhs_k = R_kappa_w[valid]
+relL2_kappa = np.linalg.norm(lhs_k - rhs_k) / (np.linalg.norm(rhs_k) + 1e-30)
+corr_kappa  = np.corrcoef(lhs_k, rhs_k)[0,1]
+print(f"[κ*win] Pixel closure  Rel-L2 = {relL2_kappa:.3e}   Corr = {corr_kappa:.6f}")
+
+# 环参数
+Rpix_min = int(min(nx,ny) * ring_inner_frac)
+Rpix_max = int(min(nx,ny) * ring_outer_frac)
+radii    = np.linspace(Rpix_min, Rpix_max, ring_count)
+dR_bg    = int(min(nx,ny) * bg_annulus_frac)
+gap_px   = max(2, int(min(nx,ny) * gap_frac))
+
+# ---- 背景补偿（mass-sheet 局部补偿） ----
+Fs_k, Ms_comp, Ms_raw, rels_k, Fvols_k = [], [], [], [], []
+for Rpix in radii:
+    F_line = ring_integral_normal(Psi_k, grids_k, Rpix, pix_rad, M_samples)
+
+    inside, rr, (YY,XX), _ = disk_mask(ny, nx, Rpix)
+    annulus = (rr > (Rpix + gap_px)) & (rr <= min(Rpix + gap_px + dR_bg, int(min(nx,ny)*ring_outer_frac + dR_bg)))
+
+    inside  = inside  & (win > win_thr)
+    annulus = annulus & (win > win_thr)
+
+    w_ann = win[annulus]; k_ann = kappa_eff[annulus]
+    k_bg  = (np.sum(k_ann*w_ann) / np.sum(w_ann)) if np.sum(w_ann)>0 else (np.mean(k_ann) if k_ann.size>0 else 0.0)
+
+    dΩ = pix_rad**2
+    M_raw  = (kappa_eff[inside] * dΩ).sum()
+    M_comp = ((kappa_eff[inside] - k_bg) * dΩ).sum()
+
+    F_vol  = (LapPsi[inside] * dΩ).sum()
+    rel_close = np.abs(F_line - 2.0*M_comp) / (np.abs(F_line)+1e-30)
+
+    Fs_k.append(F_line); Ms_comp.append(M_comp); Ms_raw.append(M_raw)
+    rels_k.append(rel_close); Fvols_k.append(F_vol)
+
+Fs_k, Ms_comp, Ms_raw, rels_k, Fvols_k = map(np.array, (Fs_k, Ms_comp, Ms_raw, rels_k, Fvols_k))
+rels_k_pct = 100*rels_k
+q1k, q3k = np.percentile(rels_k_pct, [25,75])
+a_hat  = np.sum(Fs_k*Ms_comp) / (np.sum(Ms_comp**2) + 1e-30)
+ratio2 = a_hat/2.0
+rel_diffs_k = np.abs(Fs_k - Fvols_k) / (np.abs(Fs_k)+1e-30)
+
+kappa_summary = {
+    "Rel-L2": relL2_kappa, "Corr(LHS,RHS)": corr_kappa,
+    "Gauss_median(comp)(%)": np.median(rels_k_pct), "Gauss_q1(comp)(%)": q1k, "Gauss_q3(comp)(%)": q3k, "Gauss_IQR(comp)(%)": q3k-q1k,
+    "slope_a_hat": a_hat, "a_theory": 2.0, "a_ratio": ratio2,
+    "Flux_line_vs_vol_medianΔ(%)": 100*np.median(rel_diffs_k), "Flux_line_vs_vol_maxΔ(%)": 100*np.max(rel_diffs_k)
+}
+kappa_per_ring = {"Rpix": radii, "rel_close_comp_%": rels_k_pct, "F_line": Fs_k, "F_vol": Fvols_k, "Marea_comp": Ms_comp, "Marea_raw": Ms_raw}
+save_summary("abell2744_kappa_comp", kappa_summary, kappa_per_ring, OUT_DIR)
+
+# ---- DC-consistent（面积端减去与 FFT 去除相同的 DC 常数）----
+Rbar_k   = R_kappa_w.mean()         # 被 FFT 去掉的 DC
+kappa0_dc= Rbar_k / 2.0             # 等效 κ 常数
+
+Fs_dc, Ms_dc, rels_dc = [], [], []
+for Rpix in radii:
+    F_line = ring_integral_normal(Psi_k, grids_k, Rpix, pix_rad, M_samples)
+    inside, _, _, _ = disk_mask(ny, nx, Rpix)
+    inside = inside & (win > win_thr)
+    dΩ = pix_rad**2
+    M_comp_dc = ((kappa_eff[inside] - kappa0_dc) * dΩ).sum()
+    rel_close = np.abs(F_line - 2.0*M_comp_dc) / (np.abs(F_line)+1e-30)
+    Fs_dc.append(F_line); Ms_dc.append(M_comp_dc); rels_dc.append(rel_close)
+
+rels_k_dc_pct = 100*np.array(rels_dc)
+q1kd, q3kd = np.percentile(rels_k_dc_pct, [25,75])
+a_hat_dc   = np.sum(np.array(Fs_dc)*np.array(Ms_dc)) / (np.sum(np.array(Ms_dc)**2) + 1e-30)
+ratio2_dc  = a_hat_dc/2.0
+
+kappa_dc_summary = {
+    "Gauss_median(DC)(%)": np.median(rels_k_dc_pct), "Gauss_q1(DC)(%)": q1kd, "Gauss_q3(DC)(%)": q3kd, "Gauss_IQR(DC)(%)": q3kd-q1kd,
+    "slope_a_hat(DC)": a_hat_dc, "a_theory": 2.0, "a_ratio(DC)": ratio2_dc
+}
+kappa_dc_ring = {"Rpix": radii, "rel_close_DC_%": rels_k_dc_pct, "F_line": Fs_dc, "Marea_comp_DC": Ms_dc}
+save_summary("abell2744_kappa_DC", kappa_dc_summary, kappa_dc_ring, OUT_DIR)
+
+# 图（κ）
+fig, axs = plt.subplots(1, 3, figsize=(15,5))
+im0 = axs[0].imshow(kappa, origin='lower'); axs[0].set_title("κ (convergence)")
+im1 = axs[1].imshow(Psi, origin='lower');   axs[1].set_title("ψ (κ-form)")
+im2 = axs[2].imshow((LapPsi - R_kappa_w), origin='lower'); axs[2].set_title("Residual: ∇²ψ - (2κ_eff)")
+plt.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.02)
+plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.02)
+plt.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.02)
 plt.tight_layout()
-plt.show()
-# 3) Mid-plane slices: LHS, RHS, Residual
-mid = N//2
-lhs_slice = lhs[:, :, mid]
-rhs_slice = rhs[:, :, mid]
-res_slice = residual[:, :, mid]
-plt.figure(figsize=(6,4))
-plt.imshow(lhs_slice.T, origin='lower', extent=[-L/2, L/2, -L/2, L/2], aspect='equal')
-plt.title("LHS: ∇² ln n (z=0 slice)")
-plt.xlabel("x"); plt.ylabel("y")
-plt.colorbar()
-plt.tight_layout()
-plt.show()
-plt.figure(figsize=(6,4))
-plt.imshow(rhs_slice.T, origin='lower', extent=[-L/2, L/2, -L/2, L/2], aspect='equal')
-plt.title("RHS: -(8πG/c²) ρ (z=0 slice)" if not use_zeta else "RHS: -(8πG/c²) ρ_pred (z=0 slice)")
-plt.xlabel("x"); plt.ylabel("y")
-plt.colorbar()
-plt.tight_layout()
-plt.show()
-plt.figure(figsize=(6,4))
-plt.imshow(res_slice.T, origin='lower', extent=[-L/2, L/2, -L/2, L/2], aspect='equal')
-plt.title("Residual: LHS - RHS (z=0 slice)")
-plt.xlabel("x"); plt.ylabel("y")
-plt.colorbar()
-plt.tight_layout()
-plt.show()
-# -----------------------
-# Final concise printout
-# -----------------------
-print("=== Unified Field Equation Verification (Colab, bidirectional, improved with zeta={}, control={}) ===".format(use_zeta, use_control))
-print(f"Grid: N={N}^3, dx={dx:.4e}, use_SI={use_SI}, c_used={c:.6g} m/s, G_true={G_true:.6g}, g={g_gain}")
-print(f"Closure: Rel L2={rel_L2:.6e}, Corr(LHS,RHS)={corr:.6f}")
-print(f"Residual MAE / RMSE: {mae_res:.6e} / {rmse_res:.6e}")
-print(f"[Known c] G_est median [q1,q3], IQR, MAPE%: {G_med:.6g} [{G_q1:.6g}, {G_q3:.6g}], {G_iqr:.6g}, {G_mape:.3f}%")
-print(f"[Known c] G_flux_est: {G_flux:.6g}")
-print(f"[Known G] c_est_point median [q1,q3], IQR, MAPE%: {c_med:.6g} [{c_q1:.6g}, {c_q3:.6g}], {c_iqr:.6g}, {c_mape:.3f}%")
-print(f"[Known G] c_est_flux: {c_flux:.6g} m/s")
-print(f"Multi-shell relClose: median={relClose_med_pct:.3f}%, mean={relClose_mean_pct:.3f}%, [q1,q3]={relClose_q1_pct:.3f}% - {relClose_q3_pct:.3f}%, IQR={relClose_iqr_pct:.3f}%")
-print(f"CSV saved to: {csv_path}")
+png_kappa = os.path.join(OUT_DIR, "abell2744_kappa_comp.png")
+plt.savefig(png_kappa, dpi=150); plt.show()
+print("Saved Figure:", png_kappa)
+
+print("\nDone. Outputs in:", OUT_DIR)
+# ==================================================================================================
