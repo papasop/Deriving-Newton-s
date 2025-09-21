@@ -1,307 +1,320 @@
-# @title Abell 2744 (CATS v4) κ-map → κ-DC & Σ-DC 一键复现（最终版）
-# @markdown - 自动下载 CATS v4 Abell 2744 κ FITS
-# @markdown - κ-DC：环证书 + 过原点回归（a_ratio），Gauss 中位
-# @markdown - Σ-DC：自动反推 z_s,eff + DC α 扫描；输出 α=0（像素均值DC）的主结果与逐环明细
-# @markdown - Pixel Corr：同样平滑 + 同窗（修正后 ≈1）
-# @markdown - 主要打印指标（期望典型值）：κ-DC a_ratio≈0.99974、Gauss≈0.024%；Σ-DC K_ratio≈0.9997、Gauss≈0.001%；Corr≈1.000000
-
-import os, math, urllib.request, numpy as np, pandas as pd
-import numpy.fft as nft
+# ============================================================
+#  Riemann ζ  → refractive strong-field test (Colab-ready)
+#  - Single cell, no external deps beyond NumPy/Matplotlib
+#  - Save plots/CSVs to /content, also plt.show() everything
+# ============================================================
+import os, math
+import numpy as np
+import numpy.fft as fft
 import matplotlib.pyplot as plt
-from astropy.io import fits
-from astropy.wcs import WCS
-from astropy.wcs.utils import proj_plane_pixel_scales
-from astropy.cosmology import Planck18 as cosmo
-from astropy.constants import G, c
-from astropy import units as u
-from scipy.ndimage import gaussian_filter, map_coordinates
+import pandas as pd
 
-plt.rcParams["figure.dpi"] = 120
-np.set_printoptions(suppress=True)
+# -------------------------------
+# 0) Config
+# -------------------------------
+OUTDIR = "/content"
+os.makedirs(OUTDIR, exist_ok=True)
 
-# -------------------- 路径 & 下载 --------------------
-OUT = "/content/out"; os.makedirs(OUT, exist_ok=True)
-FITS_PATH = "/content/kappa_map.fits"
-URL = "https://archive.stsci.edu/pub/hlsp/frontier/abell2744/models/cats/v4/hlsp_frontier_model_abell2744_cats_v4_kappa.fits"
+# 若你有高 t 的真实零点（1D float 数组 t_n），把它上传到 /content/zeros.npy 并设 False
+USE_BUILTIN_ZEROS = True
 
-if not os.path.exists(FITS_PATH):
-    print("Downloading:", URL)
-    urllib.request.urlretrieve(URL, FITS_PATH)
+# 强场非线性强度（可调）
+BETA0 = 0.7
+GRID_N = 224   # 提高到 384/512 会更稳（强非线性时）
+SEED = 0
+
+np.random.seed(SEED)
+
+# -------------------------------
+# 1) Load zeros
+# -------------------------------
+if USE_BUILTIN_ZEROS:
+    t_zeros = np.array([
+        14.134725141, 21.022039639, 25.010857580, 30.424876125, 32.935061588,
+        37.586178159, 40.918719012, 43.327073281, 48.005150881, 49.773832478,
+        52.970321478, 56.446247697, 59.347044003, 60.831778525, 65.112544048,
+        67.079810529, 69.546401710, 72.067157674, 75.704690699, 77.144840069,
+        79.337375020, 82.910380854, 84.735492981, 87.425274613, 88.809111208,
+        92.491899271, 94.651344041, 95.870634228, 98.831194218
+    ], dtype=float)
 else:
-    print("File exists:", FITS_PATH)
+    path = "/content/zeros.npy"
+    assert os.path.exists(path), "请先把你的真实零点数组（1D float）上传到 /content/zeros.npy"
+    t_zeros = np.load(path).astype(float)
 
-# -------------------- 读取 κ 与像素尺度（稳健） --------------------
-hdul = fits.open(FITS_PATH)
-kappa = hdul[0].data.astype(float)
-hdr = hdul[0].header
-wcs = WCS(hdr)
-ny, nx = kappa.shape
+tmin, tmax = float(t_zeros.min()), float(t_zeros.max())
 
-# 像素尺度（deg/pix → rad/pix），失败则兜底 0.3"
-def get_pix_rad(wcs, hdr):
-    try:
-        scales = proj_plane_pixel_scales(wcs)  # 每轴度/像素
-        if scales is not None and np.isfinite(scales).all():
-            return (np.sqrt((scales[0]*u.deg)*(scales[1]*u.deg))).to(u.rad).value
-    except Exception:
-        pass
-    if "CDELT1" in hdr and "CDELT2" in hdr:
-        sx = abs(hdr["CDELT1"]) * u.deg
-        sy = abs(hdr["CDELT2"]) * u.deg
-        return (np.sqrt(sx*sy)).to(u.rad).value
-    # 兜底：0.3 arcsec/pix
-    return (0.3 * u.arcsec).to(u.rad).value
+# -------------------------------
+# 2) Phase surrogate ω, θ  (Hadamard-inspired)
+# -------------------------------
+def omega_from_zeros(t_grid, t_zeros):
+    # ω(t) = 1/2 log(t/2π) + Σ (t - tn)/((t-tn)^2 + 1/4)
+    w = 0.5*np.log(t_grid/(2*np.pi))
+    for tn in t_zeros:
+        dt = t_grid - tn
+        w += dt/(dt*dt + 0.25)
+    return w
 
-pix_rad = get_pix_rad(wcs, hdr)
-print("FITS path:", FITS_PATH)
-print("kappa shape:", kappa.shape)
-print(f"Pixel scale ≈ {(pix_rad*u.rad).to(u.arcsec).value:.3f} arcsec/pix")
+Ng = max(3000, min(20000, int(40*len(t_zeros))))
+t_grid = np.linspace(tmin, tmax, Ng)
+omega = omega_from_zeros(t_grid, t_zeros)
 
-# -------------------- 工具函数 --------------------
-def safe_trapz(y, x):
-    try: return np.trapezoid(y, x)
-    except AttributeError: return np.trapz(y, x)
+# θ(t) = ∫ ω dt （梯形积分），并去均值
+theta = np.cumsum((omega[:-1] + omega[1:]) * (t_grid[1] - t_grid[0]) * 0.5)
+theta = np.concatenate([[0.0], theta])
+theta -= theta.mean()
 
-def build_window(img, apod_frac=0.10):
-    ny, nx = img.shape
-    win = np.ones_like(img, float)
-    ax = int(nx*apod_frac); ay = int(ny*apod_frac)
-    if ax>0:
-        wx = 0.5*(1-np.cos(np.linspace(0,np.pi,ax)))
-        for i in range(ax):
-            win[:, i] *= wx[i]; win[:, -i-1] *= wx[i]
-    if ay>0:
-        wy = 0.5*(1-np.cos(np.linspace(0,np.pi,ay)))
-        for j in range(ay):
-            win[j, :] *= wy[j]; win[-j-1, :] *= wy[j]
-    return win
+# -------------------------------
+# 3) Windowed SCI → K → g = 1/K with asymptotic shrinkage
+# -------------------------------
+def window_stats(t_grid, omega, W):
+    centers, Phi, H = [], [], []
+    for i in range(len(t_grid) - W + 1):
+        sl = slice(i, i+W)
+        tg = t_grid[sl]; om = omega[sl]
+        centers.append(tg.mean()); Phi.append(np.mean(om)); H.append(np.var(om))
+    return np.array(centers), np.array(Phi), np.array(H)
 
-def ring_flux_from_Phik(Phi_k, Rpix, KX, KY, pix_rad, M_samples=4096):
-    ny, nx = Phi_k.shape
-    ang = np.linspace(0, 2*np.pi, M_samples, endpoint=False)
-    cy, cx = (ny-1)/2.0, (nx-1)/2.0
-    xx = cx + Rpix*np.cos(ang); yy = cy + Rpix*np.sin(ang)
-    nxu, nyu = np.cos(ang), np.sin(ang)
-    dphidx = nft.ifft2((1j*KX)*Phi_k).real
-    dphidy = nft.ifft2((1j*KY)*Phi_k).real
-    gx = map_coordinates(dphidx, [yy, xx], order=3, mode='nearest')
-    gy = map_coordinates(dphidy, [yy, xx], order=3, mode='nearest')
-    grad_n = gx*nxu + gy*nyu
-    return safe_trapz(grad_n, ang) * (Rpix*pix_rad)
+def estimate_K(centers, Phi_w, H_w, span=51):
+    lnPhi = np.log(np.maximum(Phi_w, 1e-12))
+    lnH   = np.log(np.maximum(H_w,  1e-18))
+    K = np.zeros_like(lnPhi)
+    half = span // 2
+    for i in range(len(lnPhi)):
+        a = max(0, i-half); b = min(len(lnPhi), i+half+1)
+        x = lnPhi[a:b]; y = lnH[a:b]
+        A = np.vstack([x, np.ones_like(x)]).T
+        sol, *_ = np.linalg.lstsq(A, y, rcond=None)
+        K[i] = sol[0]
+    c_trim = centers[half:len(centers)-half]
+    return c_trim, K[half:len(K)-half]
 
-def disk_mask(ny, nx, Rpix):
-    yy, xx = np.indices((ny, nx))
-    cy, cx = (ny-1)/2.0, (nx-1)/2.0
-    rr = np.hypot(yy-cy, xx-cx)
-    return (rr<=Rpix)
+W = max(60, len(t_grid)//80)  # ~1.25% 窗宽
+centers, Phi_w, H_w = window_stats(t_grid, omega, W)
+cK, K_est = estimate_K(centers, Phi_w, H_w, span=51)
 
-def corrcoef2(a, b):
-    A=a.ravel()-a.mean(); B=b.ravel()-b.mean()
-    den = (np.linalg.norm(A)*np.linalg.norm(B)+1e-30)
-    return float(np.dot(A,B)/den)
+# 渐近修正： g_asym = 1/2 + π / [6 log(t/2π)]
+L = np.log(np.maximum(cK/(2*np.pi), 2.0))
+g_asym = 0.5 + np.pi/(6.0*L)
+g_emp  = 1.0 / np.maximum(K_est, 1e-6)
 
-# -------------------- 公共参数 --------------------
-z_d_init = 0.308
-z_s_init = 2.0
-sigma_pix = 1.5
-apod_frac = 0.10
-ring_count = 24
-ring_inner_frac, ring_outer_frac = 0.10, 0.35
-M_samples = 4096
+# 低 t 用收缩（λ 大），高 t 让 1/K 主导（λ 小）
+lam   = np.minimum(1.0, 1.0/np.maximum(L, 1.0))
+g_hat = lam*g_asym + (1.0 - lam)*g_emp
 
-# FFT 频率格
-kx = nft.fftfreq(nx, d=pix_rad) * 2*np.pi
-ky = nft.fftfreq(ny, d=pix_rad) * 2*np.pi
-KX, KY = np.meshgrid(kx, ky, indexing='xy')
-k2 = KX**2 + KY**2
-
-# 窗函数
-win = build_window(kappa, apod_frac=apod_frac)
-
-# =========================================================
-# 1) κ-DC（compensated, window-consistent）
-# =========================================================
-kappa_s   = gaussian_filter(kappa, sigma=sigma_pix)
-kappa_eff = kappa_s * win
-kappa0_dc = kappa_eff.sum() / (kappa_eff.size + 1e-30)  # 像素均值 DC → 对齐 FFT 零模
-
-def kappa_ring_metrics(kappa_eff, kappa0):
-    ny, nx = kappa_eff.shape
-    Rmin = int(min(nx,ny)*ring_inner_frac); Rmax = int(min(nx,ny)*ring_outer_frac)
-    radii = np.linspace(Rmin, Rmax, ring_count)
-    # 势（常数不影响回归/证书）
-    Rw = - kappa_eff
-    Rk = nft.fft2(Rw)
-    Phi_k = np.zeros_like(Rk, complex); m=(k2>0); Phi_k[m]=Rk[m]/(-k2[m])
-    Fs, Ms, rels = [], [], []
-    for Rpix in radii:
-        F = ring_flux_from_Phik(Phi_k, Rpix, KX, KY, pix_rad, M_samples=M_samples)
-        inside = disk_mask(ny, nx, Rpix)
-        M = ((kappa_eff[inside]-kappa0)*(pix_rad**2)).sum()
-        rel = abs(F + 1.0*M) / (abs(F)+1e-30)  # κ-DC 的常数为 1
-        Fs.append(F); Ms.append(M); rels.append(rel)
-    Fs, Ms, rels = map(np.array, (Fs, Ms, rels))
-    a_hat = - float(np.sum(Fs*Ms) / (np.sum(Ms**2)+1e-30))
-    a_ratio = a_hat / 1.0
-    return radii, Fs, Ms, 100*rels, a_hat, a_ratio
-
-radii_k, Fk, Mk, rels_k, a_hat, a_ratio = kappa_ring_metrics(kappa_eff, kappa0_dc)
-k_gauss_med = float(np.median(rels_k))
-k_gauss_q1  = float(np.percentile(rels_k,25))
-k_gauss_q3  = float(np.percentile(rels_k,75))
-
-# 保存 κ per-ring / summary
-pd.DataFrame({"Rpix":radii_k, "F_line":Fk, "M_comp_DC":Mk, "rel_close_DC_%":rels_k})\
-  .to_csv(os.path.join(OUT,"abell2744_kappa_DC_per_ring.csv"), index=False)
-pd.DataFrame({
-    "Metric":["Gauss_median(DC)(%)","Gauss_q1(DC)(%)","Gauss_q3(DC)(%)","a_hat(DC)","a_ratio(DC)"],
-    "Value":[k_gauss_med, k_gauss_q1, k_gauss_q3, a_hat, a_ratio]
-}).to_csv(os.path.join(OUT,"abell2744_kappa_DC_summary.csv"), index=False)
-
-# =========================================================
-# 2) Σ-DC：自动反推 z_s,eff + α 扫描；主结果为 α=0（像素均值 DC）
-# =========================================================
-def Sigma_crit_of(z_d, z_s):
-    Dd  = cosmo.angular_diameter_distance(z_d).to(u.m)
-    Ds  = cosmo.angular_diameter_distance(z_s).to(u.m)
-    Dds = cosmo.angular_diameter_distance_z1z2(z_d, z_s).to(u.m)
-    return (c**2/(4*np.pi*G) * (Ds/(Dd*Dds))).to(u.kg/(u.m*u.m)).value
-
-def Sigma_and_eff(z_d, z_s):
-    Scrit = Sigma_crit_of(z_d, z_s)
-    Sigma = kappa * Scrit
-    Sigma_s = gaussian_filter(Sigma, sigma=sigma_pix)
-    return Sigma, Sigma_s*win, Scrit
-
-def Phi_from_RHS(rhs):
-    Rk = nft.fft2(rhs)
-    Phi_k = np.zeros_like(Rk, complex); m=(k2>0); Phi_k[m]=Rk[m]/(-k2[m])
-    return Phi_k, nft.ifft2(Phi_k).real
-
-def Sigma_gauss_Kratio(Sigma_eff, dc_mode="weighted"):
-    ny, nx = Sigma_eff.shape
-    Kc = 8*np.pi*G.value/(c.value**2)
-    Phi_k, _ = Phi_from_RHS(-Kc * Sigma_eff)
-    if dc_mode=="weighted":
-        Sigma0 = Sigma_eff.sum() / (win.sum()+1e-30)
-    elif dc_mode=="pixel":
-        Sigma0 = Sigma_eff.sum() / (Sigma_eff.size+1e-30)
-    else:
-        Sigma0 = 0.0
-    Rmin = int(min(nx,ny)*ring_inner_frac); Rmax = int(min(nx,ny)*ring_outer_frac)
-    radii = np.linspace(Rmin, Rmax, ring_count)
-    Fs, Ms, rels = [], [], []
-    for Rpix in radii:
-        F = ring_flux_from_Phik(Phi_k, Rpix, KX, KY, pix_rad, M_samples=M_samples)
-        inside = disk_mask(ny, nx, Rpix)
-        M = ((Sigma_eff[inside]-Sigma0)*(pix_rad**2)).sum()
-        rel = abs(F + Kc*M) / (abs(F)+1e-30)
-        Fs.append(F); Ms.append(M); rels.append(rel)
-    Fs, Ms, rels = map(np.array, (Fs, Ms, rels))
-    K_hat = - float(np.sum(Fs*Ms) / (np.sum(Ms**2)+1e-30))
-    return K_hat / (8*np.pi*G.value/(c.value**2)), 100*np.median(rels), (radii, Fs, Ms, rels)
-
-# 初始 z_s_init，在 weighted-DC 下得到 K_ratio0，据此反推 z_s,eff
-Sigma, Sigma_eff, Scrit0 = Sigma_and_eff(z_d_init, z_s_init)
-K_ratio0, _, _ = Sigma_gauss_Kratio(Sigma_eff, dc_mode="weighted")
-target_Scrit = Scrit0 * K_ratio0
-
-def find_zs_for_Scrit(target):
-    lo, hi = max(z_d_init+1e-3, 0.35), 10.0
-    for _ in range(80):
-        mid = 0.5*(lo+hi)
-        Sc = Sigma_crit_of(z_d_init, mid)
-        if Sc > target: lo = mid
-        else: hi = mid
-    return 0.5*(lo+hi)
-
-z_s_eff = find_zs_for_Scrit(target_Scrit)
-
-# 用 z_s,eff，准备 α 扫描与 α=0 的主结果
-Sigma, Sigma_eff, Scrit_eff = Sigma_and_eff(z_d_init, z_s_eff)
-K_const = 8*np.pi*G.value/(c.value**2)
-Phi_k_eff, _ = Phi_from_RHS(-K_const * Sigma_eff)
-
-Rmin = int(min(nx,ny)*ring_inner_frac); Rmax = int(min(nx,ny)*ring_outer_frac)
-radii = np.linspace(Rmin, Rmax, ring_count)
-Fs = np.array([ring_flux_from_Phik(Phi_k_eff, R, KX, KY, pix_rad, M_samples=M_samples) for R in radii])
-areas = np.array([disk_mask(ny, nx, R).sum() for R in radii]) * (pix_rad**2)
-S_in  = np.array([(Sigma_eff[disk_mask(ny,nx,R)]).sum() for R in radii]) * (pix_rad**2)
-
-dc_weighted = Sigma_eff.sum() / (win.sum()+1e-30)
-dc_pixel    = Sigma_eff.sum() / (Sigma_eff.size+1e-30)
-
-# α 扫描（保存全表）
-alphas = np.linspace(0,1,51)
-scan_rows=[]
-for a in alphas:
-    Sigma0 = a*dc_weighted + (1-a)*dc_pixel
-    Ms = S_in - areas*Sigma0
-    K_hat = - float(np.sum(Fs*Ms) / (np.sum(Ms**2)+1e-30))
-    K_ratio = K_hat / K_const
-    rels = np.abs(Fs + K_const*Ms) / (np.abs(Fs)+1e-30)
-    scan_rows.append([a, K_ratio, 100*np.median(rels), 100*np.percentile(rels,25), 100*np.percentile(rels,75)])
-scan = pd.DataFrame(scan_rows, columns=["alpha","K_ratio","Gauss_median_%","Gauss_q1_%","Gauss_q3_%"])
-scan.to_csv(os.path.join(OUT,"abell2744_sigma_DCalpha_scan.csv"), index=False)
-
-# α* 仅供参考（实际主文档用 α=0）
-a_star_row = scan.iloc[np.argmin(np.abs(scan["K_ratio"]-1.0))]
-alpha_star = float(a_star_row["alpha"]); K_ratio_star = float(a_star_row["K_ratio"])
-Gauss_med_star = float(a_star_row["Gauss_median_%"])
-
-# α=0（像素均值 DC）：主结果 + per-ring 明细
-Sigma0_doc = dc_pixel
-Ms_doc = S_in - areas*Sigma0_doc
-K_hat_doc = - float(np.sum(Fs*Ms_doc) / (np.sum(Ms_doc**2)+1e-30))
-K_ratio_doc = K_hat_doc / K_const
-rels_doc = np.abs(Fs + K_const*Ms_doc) / (np.abs(Fs)+1e-30)
-Gauss_med_doc = float(np.median(100*rels_doc))
-Gauss_q1_doc  = float(np.percentile(100*rels_doc,25))
-Gauss_q3_doc  = float(np.percentile(100*rels_doc,75))
-
-# 保存 Σ-DC 汇总与逐环（α=0）
-pd.DataFrame({
-    "Metric":["z_s_eff","alpha_star","Sigma_crit(kg/m^2)","K_ratio(DC)_alpha*","Gauss_median(%)_alpha*",
-              "K_ratio(DC)_alpha0","Gauss_median(%)_alpha0","Gauss_q1(%)_alpha0","Gauss_q3(%)_alpha0"],
-    "Value":[float(z_s_eff), alpha_star, Scrit_eff, K_ratio_star, Gauss_med_star,
-             K_ratio_doc, Gauss_med_doc, Gauss_q1_doc, Gauss_q3_doc]
-}).to_csv(os.path.join(OUT,"abell2744_sigma_DCalpha_summary.csv"), index=False)
-
-pd.DataFrame({
-    "Rpix":radii,
-    "F_line":Fs,
-    "Marea_comp(DC_alpha0)":Ms_doc,
-    "rel_close_DC_alpha0_%":100*rels_doc
-}).to_csv(os.path.join(OUT,"abell2744_sigma_DC_per_ring_alpha0.csv"), index=False)
-
-# 简单图（κ 预览 & Σ-DC 扫描）
-plt.figure(figsize=(5,4))
-plt.imshow(gaussian_filter(kappa, sigma=sigma_pix)*win, origin="lower", cmap="magma")
-plt.colorbar(label="κ (smoothed*win)")
-plt.title("Abell 2744 κ (smoothed & windowed)")
-plt.tight_layout()
-plt.savefig(os.path.join(OUT,"abell2744_kappa_smoothed.png")); plt.close()
-
-plt.figure(figsize=(5,4))
-plt.plot(scan["alpha"], scan["K_ratio"], lw=2, label="K_ratio(α)")
-plt.axhline(1.0, ls="--", lw=1, color="k")
-plt.scatter([alpha_star],[K_ratio_star], zorder=3, label=f"α*={alpha_star:.2f}")
-plt.xlabel("alpha (DC mix)"); plt.ylabel("K_ratio")
-plt.title("Σ-DC: K_ratio vs α")
+# g(t) 图
+plt.figure(figsize=(6.4,4))
+plt.plot(cK, g_emp,  label="1/K (emp)", alpha=0.6)
+plt.plot(cK, g_asym, label="asym 1/2 + π/[6 log(t/2π)]", alpha=0.8)
+plt.plot(cK, g_hat,  label="ĝ (shrinkage)", lw=2)
+plt.xlabel("t (window center)"); plt.ylabel("g(t)"); plt.title("g(t) from real ζ zeros")
 plt.legend(); plt.tight_layout()
-plt.savefig(os.path.join(OUT,"abell2744_sigma_Kratio_vs_alpha.png")); plt.close()
+plt.savefig(f"{OUTDIR}/g_of_t_realzeros.png", dpi=160)
+plt.show()
 
-# =========================================================
-# 3) Pixel Corr（修正：两边同样平滑 + 同窗）
-# =========================================================
-kappa_cmp = gaussian_filter(kappa, sigma=sigma_pix) * win
-sigma_over_scrit = (Sigma / Scrit_eff)                           # = κ（在同一源面归一）
-sigma_over_scrit_cmp = gaussian_filter(sigma_over_scrit, sigma=sigma_pix) * win
-Corr_pix = corrcoef2(kappa_cmp, sigma_over_scrit_cmp)
+# CSV
+pd.DataFrame({"t_center": cK, "g_emp": g_emp, "g_asym": g_asym, "g_hat": g_hat, "lambda": lam})\
+  .to_csv(f"{OUTDIR}/g_of_t_realzeros.csv", index=False)
 
-# -------------------- 打印关键结果 --------------------
-print("\n=== 复现实绩 ===")
-print(f"κ-DC: a_ratio(DC) = {a_ratio:.5f}   Gauss median = {k_gauss_med:.3f}%")
-print(f"Σ-DC: K_ratio(DC) = {K_ratio_doc:.5f}   Gauss median = {Gauss_med_doc:.3f}%   (z_s,eff ≈ {z_s_eff:.6f})")
-print(f"Pixel Corr = {Corr_pix:.6f}")
-print("\nOutputs in:", OUT)
+# -------------------------------
+# 4) Embed to space: U(x)=k·x+b → φ_seed = g(U)[θ(U)-⟨θ⟩]
+# -------------------------------
+N = GRID_N
+Lx = Ly = 2.0
+x = np.linspace(0, Lx, N, endpoint=False)
+y = np.linspace(0, Ly, N, endpoint=False)
+X, Y = np.meshgrid(x, y, indexing='ij')
+
+U = tmin + (tmax - tmin) * (X / Lx)  # 单调沿 x
+theta_U = np.interp(U, t_grid, theta)
+g_U     = np.interp(U, cK, g_hat, left=g_asym[0], right=g_asym[-1])
+
+phi_seed = g_U * (theta_U - theta_U.mean())
+phi_seed -= phi_seed.mean()
+
+plt.figure(figsize=(6,5))
+plt.imshow(phi_seed.T, origin='lower', extent=[0,Lx,0,Ly], aspect='equal')
+plt.colorbar(); plt.title(r"$\phi_{\rm seed}=g(U)[\theta(U)-\langle\theta\rangle]$ (real zeros)")
+plt.xlabel("x"); plt.ylabel("y"); plt.tight_layout()
+plt.savefig(f"{OUTDIR}/phi_seed_realzeros.png", dpi=160)
+plt.show()
+
+# -------------------------------
+# 5) Spectral ops & fields
+# -------------------------------
+kx = 2*np.pi*fft.fftfreq(N, d=Lx/N)
+ky = 2*np.pi*fft.fftfreq(N, d=Ly/N)
+KX, KY = np.meshgrid(kx, ky, indexing='ij')
+K2 = KX**2 + KY**2
+K2[0,0] = 1.0  # avoid 0-div
+
+def grad(phi):
+    ph = fft.fft2(phi)
+    gx = np.real(fft.ifft2(1j*KX*ph))
+    gy = np.real(fft.ifft2(1j*KY*ph))
+    return gx, gy
+
+def lap(phi):
+    ph = fft.fft2(phi)
+    return np.real(fft.ifft2(-K2*ph))
+
+def invlap(rhs):
+    Rh = fft.fft2(rhs)
+    Ph = Rh / (-K2)
+    Ph[0,0] = 0.0
+    return np.real(fft.ifft2(Ph))
+
+kappa = 1.0
+rho = -lap(phi_seed)
+rho -= rho.mean()  # periodic DC 修正
+
+# -------------------------------
+# 6) β(x) from gradient proxy & Strong-field solve
+# PDE: ∇²φ + β(x) |∇φ|^4 = -κρ
+# -------------------------------
+gx0, gy0 = grad(phi_seed)
+g2_0 = gx0*gx0 + gy0*gy0
+beta_map = BETA0 * (g2_0 / (np.percentile(g2_0, 90) + 1e-12))   # 归一化
+beta_map = np.clip(beta_map, 0.0, BETA0)
+# 光滑一下 β，避免棋盘格
+beta_map = 0.5 * (beta_map + (np.roll(beta_map,1,0)+np.roll(beta_map,-1,0)+
+                               np.roll(beta_map,1,1)+np.roll(beta_map,-1,1))/4.0)
+
+def solve_strong(rho, beta_map, steps=6, iters=240, tol=2e-6, relax=0.62):
+    phi = invlap(-kappa*rho); phi -= phi.mean()
+    res_hist = []
+    for s in range(1, steps+1):
+        w = s / steps
+        beta_eff = w * beta_map
+        for it in range(iters):
+            gx, gy = grad(phi)
+            g2 = gx*gx + gy*gy
+            rhs = -kappa*rho - beta_eff*(g2**2)
+            phi_new = invlap(rhs)
+            phi = (1.0-relax)*phi + relax*phi_new
+            phi -= phi.mean()
+            F = lap(phi) + beta_eff*(g2**2) + kappa*rho
+            res = float(np.sqrt(np.mean(F**2)))
+            res_hist.append(res)
+            if res < tol:
+                break
+    return phi, np.array(res_hist)
+
+phi_lin = invlap(-kappa*rho); phi_lin -= phi_lin.mean()
+phi_non, hist = solve_strong(rho, beta_map)
+
+plt.figure(figsize=(6.4,4))
+plt.semilogy(hist)
+plt.xlabel("Iteration"); plt.ylabel("RMS residual")
+plt.title("Strong-field residual (real zeros)")
+plt.tight_layout()
+plt.savefig(f"{OUTDIR}/residual_realzeros.png", dpi=160)
+plt.show()
+
+# -------------------------------
+# 7) Observables: deflection α(b) & Δα(b)
+# -------------------------------
+def deflection(phi):
+    gx, gy = grad(phi)
+    # Born-like: integrate ∂x φ along y
+    return np.trapz(gx, y, axis=1)
+
+b = x
+alpha_lin = deflection(phi_lin)
+alpha_non = deflection(phi_non)
+delta_alpha = alpha_non - alpha_lin
+
+plt.figure(figsize=(6.4,4))
+plt.plot(b, alpha_lin, label="linear")
+plt.plot(b, alpha_non, label="nonlinear")
+plt.xlabel("impact parameter b"); plt.ylabel("deflection α(b)")
+plt.title("Deflection vs b (real zeros)")
+plt.legend(); plt.tight_layout()
+plt.savefig(f"{OUTDIR}/deflection_realzeros_full.png", dpi=160)
+plt.show()
+
+plt.figure(figsize=(6.4,3.6))
+plt.plot(b, delta_alpha)
+plt.axhline(0, color='k', lw=0.8)
+plt.xlabel("b"); plt.ylabel("Δα(b)")
+plt.title("Δα(b) = α_NL - α_Lin (real zeros)")
+plt.tight_layout()
+plt.savefig(f"{OUTDIR}/delta_alpha_realzeros_full.png", dpi=160)
+plt.show()
+
+# CSV
+pd.DataFrame({"b": b, "alpha_linear": alpha_lin, "alpha_nonlinear": alpha_non, "delta_alpha": delta_alpha})\
+  .to_csv(f"{OUTDIR}/deflection_realzeros_full.csv", index=False)
+
+# -------------------------------
+# 8) Nonlinear Gauss closure (square shells)
+#  ∮∂V ∇φ·n dS + κ∫V ρ dA + ∫V β|∇φ|^4 dA ≈ 0
+# -------------------------------
+def gauss_square_closure(phi, rho, beta_map, center, half_sizes):
+    gx, gy = grad(phi)
+    dA = (Lx/N) * (Ly/N)
+    rels, fluxes, masses, Nterms = [], [], [], []
+
+    def sample(arr, xi, yi):
+        i = (xi/Lx)*N; j = (yi/Ly)*N
+        i0 = np.floor(i).astype(int)%N; j0 = np.floor(j).astype(int)%N
+        di = i - i0; dj = j - j0
+        i1 = (i0+1)%N; j1 = (j0+1)%N
+        return ((1-di)*(1-dj)*arr[i0,j0] + di*(1-dj)*arr[i1,j0] +
+                (1-di)*dj*arr[i0,j1] + di*dj*arr[i1,j1])
+
+    cx, cy = center; m = 2048
+    for a in np.asarray(half_sizes):
+        t = np.linspace(-a, a, m, endpoint=False)
+        xl, yl = (cx - a)*np.ones_like(t), cy + t
+        xr, yr = (cx + a)*np.ones_like(t), cy + t
+        xb, yb = cx + t, (cy - a)*np.ones_like(t)
+        xt, yt = cx + t, (cy + a)*np.ones_like(t)
+        gx_l = sample(gx, xl, yl); gy_l = sample(gy, xl, yl)
+        gx_r = sample(gx, xr, yr); gy_r = sample(gy, xr, yr)
+        gx_b = sample(gx, xb, yb); gy_b = sample(gy, xb, yb)
+        gx_t = sample(gx, xt, yt); gy_t = sample(gy, xt, yt)
+        flux = (np.trapz(-gx_l, t) + np.trapz(+gx_r, t) +
+                np.trapz(-gy_b, t) + np.trapz(+gy_t, t))
+
+        mask = (np.abs((X-cx))<=a) & (np.abs((Y-cy))<=a)
+        mass = rho[mask].sum()*dA
+        gxv, gyv = gx[mask], gy[mask]
+        Nterm = (beta_map[mask]*((gxv*gxv + gyv*gyv)**2)).sum()*dA
+
+        clos = flux + kappa*mass + Nterm
+        denom = np.abs(flux) + np.abs(kappa*mass) + np.abs(Nterm) + 1e-12
+        rels.append(np.abs(clos)/denom)
+        fluxes.append(flux); masses.append(mass); Nterms.append(Nterm)
+
+    return np.array(rels), np.array(fluxes), np.array(masses), np.array(Nterms)
+
+half_sizes = np.linspace(0.06*Lx, 0.35*Lx, 24)
+rels, Fv, Mv, Nv = gauss_square_closure(phi_non, rho, beta_map, (0.5*Lx, 0.5*Ly), half_sizes)
+
+plt.figure(figsize=(6.4,3.6))
+plt.plot(half_sizes, rels)
+plt.xlabel("half-size"); plt.ylabel("relative closure")
+plt.title("Nonlinear Gauss closure (real zeros)")
+plt.tight_layout()
+plt.savefig(f"{OUTDIR}/closure_realzeros.png", dpi=160)
+plt.show()
+
+pd.DataFrame({"half_size": half_sizes, "rel_closure": rels,
+              "flux": Fv, "mass_term": kappa*Mv, "nonlinear_term": Nv})\
+  .to_csv(f"{OUTDIR}/closure_realzeros.csv", index=False)
+
+# -------------------------------
+# 9) Paths print (as requested)
+# -------------------------------
+print("Artifacts saved in", OUTDIR)
+print("- g(t):            ", f"{OUTDIR}/g_of_t_realzeros.png")
+print("- φ_seed map:      ", f"{OUTDIR}/phi_seed_realzeros.png")
+print("- residual history:", f"{OUTDIR}/residual_realzeros.png")
+print("- deflection:      ", f"{OUTDIR}/deflection_realzeros_full.png")
+print("- delta-alpha:     ", f"{OUTDIR}/delta_alpha_realzeros_full.png")
+print("- closure:         ", f"{OUTDIR}/closure_realzeros.png")
+print("- CSVs:")
+print("  •", f"{OUTDIR}/g_of_t_realzeros.csv")
+print("  •", f"{OUTDIR}/deflection_realzeros_full.csv")
+print("  •", f"{OUTDIR}/closure_realzeros.csv")
