@@ -414,4 +414,3 @@ plt.title("ζ–U Eq.(5) — Elliptic & Dual embeddings")
 plt.axis("off"); plt.tight_layout(); plt.show()
 
 print("提示：若要进一步冲 Ridge-F1≥0.10，可仅微调 AFFINE_SCALE_SCAN 或 RIDGE_Q / RIDGE_MIN_SEP（评估容差），其余参数不变。")
-
