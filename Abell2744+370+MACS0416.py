@@ -1,18 +1,63 @@
 # ==========================================================
-# ζ–U Eq.(5) 验证：γ̄² + Ridge-F1 + 三对照（单格完整版）
-# 依赖：numpy, matplotlib, astropy, scipy, scikit-image, mpmath（自动安装）
-# 不读/不写文件；仅 plt / print 输出
+# ζ–U Binding (Eq.5) — Cross-coherence (γ̄²) + Ridge-F1 + Morphology
+# Full clean, single-cell Colab script
 # ==========================================================
+
+# ---------------- Locked (PRIMARY) params: keep fixed for replication ----------------
+PRIMARY = {
+    # U embedding: "radial-from-peak" | "elliptic-from-moments" | "dual-from-twopeaks"
+    "EMBEDDING": "radial-from-peak",      # 建议再试："elliptic-from-moments" / "dual-from-twopeaks"
+    "T_LO": 80.0, "T_HI": 6000.0,         # ζ 相位 t-区间
+    "THETA_GRID_N": 1000,                 # ζ 相位预计算网格
+    "TARGET_N": 512,                      # 统一重采样尺寸
+    "SIGMA_SMOOTH_DATA": 1.0,             # κ data 轻平滑
+    "SIGMA_SMOOTH_PRED": 2.0,             # κ_pred 轻平滑
+    "TUKEY_ALPHA": 0.20,                  # 2D Tukey 窗
+    "BANDPASS": (0.10, 0.25),             # 带通区（锁参）
+    "SLOPE_FIT_FRAC": (0.10, 0.25),       # 幂谱斜率拟合区
+    "BEST_SHIFT_MAX": 6,                  # best-shift 搜索窗口
+    # Ridge skeleton settings (robust geometry)
+    "RIDGE_SIGMAS": (1.5, 3.0, 6.0),      # LoG 多尺度
+    "RIDGE_Q": 0.97,                      # 脊线二值阈值（分位）
+    "RIDGE_MIN_SEP": 14,                  # 脊线采样点最小间距（px）
+    "F1_MATCH_RADIUS": 12,                # 匹配半径（px）
+    # Morphology
+    "MORPH_Q": 0.90,
+    "MORPH_MIN_SIZE": 100,
+    "MPP": None,                          # 可设物理尺（Mpc/px）；未知则 None
+    # Elliptic embedding helpers
+    "ELLIPSE_Q_FOR_MASK": 0.80,           # 计算二阶矩时取 κ 的上分位阈
+    "ELLIPSE_MIN_AXIS_RATIO": 0.5,        # 轴比下限
+    # Dual-peak embedding helpers
+    "DUAL_TOP_N": 2,
+    "DUAL_MIN_SEP_PX": 40,
+    "DUAL_BLEND": "softmin",              # "min" or "softmin"
+    "DUAL_TAU": 0.08,                     # softmin 温度
+    # Affine (scale) scan for Ridge-F1 after best-shift
+    "AFFINE_SCALE_SCAN": [0.95, 0.975, 1.0, 1.025, 1.05],
+}
+THRESH = {"gamma2_min": 0.05, "f1_min": 0.10, "r_bonus": 0.03}
+
+# ---------------- Datasets (CATS v4 kappa FITS; direct links) ----------------
+A2744_URL   = "https://archive.stsci.edu/pub/hlsp/frontier/abell2744/models/cats/v4/hlsp_frontier_model_abell2744_cats_v4_kappa.fits"
+MACS0416_URL= "https://archive.stsci.edu/pub/hlsp/frontier/macs0416/models/cats/v4/hlsp_frontier_model_macs0416_cats_v4_kappa.fits"
+A370_URL    = "https://archive.stsci.edu/pub/hlsp/frontier/abell370/models/cats/v4/hlsp_frontier_model_abell370_cats_v4_kappa.fits"
+
+DATASETS = [
+    ("Abell2744_CATSv4", A2744_URL),
+    ("MACS0416_CATSv4",  MACS0416_URL),
+    ("Abell370_CATSv4",  A370_URL),
+]
+
+# ---------------- Installs / Imports ----------------
 import sys, subprocess, warnings
 warnings.filterwarnings("ignore")
-def _pip(pkgs): subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + pkgs)
-
-# installs / imports
+def _pip(x): subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + x)
 try:
     import numpy as np, matplotlib.pyplot as plt
     from astropy.io import fits
     from scipy.ndimage import (gaussian_filter, maximum_filter, label, find_objects,
-                               zoom, gaussian_laplace, binary_erosion, binary_opening)
+                               zoom, gaussian_laplace, binary_erosion, binary_opening, binary_dilation)
     from scipy import fft as spfft
     from scipy.stats import pearsonr
     from scipy.signal import tukey
@@ -23,7 +68,7 @@ except Exception:
     import numpy as np, matplotlib.pyplot as plt
     from astropy.io import fits
     from scipy.ndimage import (gaussian_filter, maximum_filter, label, find_objects,
-                               zoom, gaussian_laplace, binary_erosion, binary_opening)
+                               zoom, gaussian_laplace, binary_erosion, binary_opening, binary_dilation)
     from scipy import fft as spfft
     from scipy.stats import pearsonr
     from scipy.signal import tukey
@@ -35,29 +80,6 @@ try:
 except Exception:
     _pip(["mpmath"])
     import mpmath as mp
-
-# ---------------- Locked params（建议保持不变做复现） ----------------
-BASE_CFG = {
-    "T_LO": 80.0, "T_HI": 6000.0, "THETA_GRID_N": 1000,      # ζ 相位区间与采样
-    "TARGET_N": 512,                                         # 统一重采样
-    "SIGMA_SMOOTH_DATA": 1.0, "SIGMA_SMOOTH_PRED": 2.0,      # 轻平滑
-    "TUKEY_ALPHA": 0.20,                                     # 窗函数
-    "BANDPASS": (0.10, 0.25), "SLOPE_FIT_FRAC": (0.10, 0.25),
-    "BEST_SHIFT_MAX": 6,
-    "RIDGE_SIGMAS": (1.5, 3.0, 6.0), "RIDGE_Q": 0.97, "RIDGE_MIN_SEP": 14,
-    "F1_MATCH_RADIUS": 12,
-    "MORPH_Q": 0.90, "MORPH_MIN_SIZE": 100,
-    "ELLIPSE_Q_FOR_MASK": 0.80, "ELLIPSE_MIN_AXIS_RATIO": 0.5,
-    "DUAL_MIN_SEP_PX": 40, "DUAL_BLEND": "softmin", "DUAL_TAU": 0.08,
-    "AFFINE_SCALE_SCAN": [0.95, 0.975, 1.0, 1.025, 1.05],
-    "THRESH": {"gamma2_min": 0.05, "f1_min": 0.10, "r_bonus": 0.03},
-}
-
-# 数据集（HFF CATS v4）
-A2744_URL   = "https://archive.stsci.edu/pub/hlsp/frontier/abell2744/models/cats/v4/hlsp_frontier_model_abell2744_cats_v4_kappa.fits"
-MACS0416_URL= "https://archive.stsci.edu/pub/hlsp/frontier/macs0416/models/cats/v4/hlsp_frontier_model_macs0416_cats_v4_kappa.fits"
-A370_URL    = "https://archive.stsci.edu/pub/hlsp/frontier/abell370/models/cats/v4/hlsp_frontier_model_abell370_cats_v4_kappa.fits"
-DATASETS    = [("Abell2744_CATSv4", A2744_URL), ("MACS0416_CATSv4", MACS0416_URL), ("Abell370_CATSv4", A370_URL)]
 
 # ---------------- Utilities ----------------
 def zscore(a): m=np.mean(a); s=np.std(a)+1e-12; return (a-m)/s
@@ -125,14 +147,16 @@ def theta_exact_from_U(U, t_lo=80.0, t_hi=6000.0, GRID_N=1000, mp_dps=50):
     t_grid,theta_grid=get_theta_grid(t_lo,t_hi,GRID_N,mp_dps)
     th=np.interp(tmap,t_grid,theta_grid); return th-np.mean(th)
 
-# ---- Embedding helpers & modes ----
+# ---- Embedding helpers ----
+from scipy.ndimage import binary_opening, binary_erosion
 def _binary_top_quantile(mask_src, q):
     thr = np.quantile(mask_src, q); return (mask_src >= thr)
 
-def _ellipse_from_mask(mask, min_ar=0.5):
-    ys, xs = np.where(mask); h, w = mask.shape
+def _ellipse_from_mask(mask):
+    ys, xs = np.where(mask)
+    h, w = mask.shape
     if len(ys) < 10:
-        return (h/2, w/2, max(h,w)/4, max(h,w)/6, 0.0)
+        return (h/2, w/2, max(h,w)/4, max(h,w)/6, 0.0)  # fallback
     y = ys.astype(np.float64); x = xs.astype(np.float64)
     cy, cx = float(y.mean()), float(x.mean())
     Y = y - cy; X = x - cx
@@ -141,7 +165,8 @@ def _ellipse_from_mask(mask, min_ar=0.5):
     order = np.argsort(vals)[::-1]; vals = vals[order]; vecs = vecs[:, order]
     a = np.sqrt(max(vals[0], 1e-9))*2.5
     b = np.sqrt(max(vals[1], 1e-9))*2.5
-    ar = max(b/a if a>1e-9 else 0.0, min_ar); b = a*ar
+    ar = b/a if a>1e-9 else 0.0
+    ar = max(ar, PRIMARY["ELLIPSE_MIN_AXIS_RATIO"]); b = a*ar
     vx = vecs[:,0]  # (y,x)
     angle = np.arctan2(vx[0], vx[1])
     return (cy, cx, a, b, angle)
@@ -150,7 +175,8 @@ def _mahalanobis_r(y, x, cy, cx, a, b, angle):
     ca, sa = np.cos(angle), np.sin(angle)
     dy, dx = (y - cy), (x - cx)
     u = ca*dx + sa*dy; v = -sa*dx + ca*dy
-    return np.sqrt((u/(a+1e-12))**2 + (v/(b+1e-12))**2) + 1e-6
+    r = np.sqrt((u/(a+1e-12))**2 + (v/(b+1e-12))**2) + 1e-6
+    return r
 
 def _top_two_peaks(kappa, min_sep=40):
     neigh = maximum_filter(kappa, size=min_sep)
@@ -160,7 +186,7 @@ def _top_two_peaks(kappa, min_sep=40):
         cy, cx = np.unravel_index(np.argmax(kappa), kappa.shape)
         return [(cy, cx)]
     sls = find_objects(lab); centers=[]
-    for sl in sls:
+    for i, sl in enumerate(sls, start=1):
         if sl is None: continue
         ys, xs = sl; sub = kappa[ys, xs]
         iy, ix = np.unravel_index(np.argmax(sub), sub.shape)
@@ -177,38 +203,43 @@ def _softmin(a, b, tau=0.08):
     m = np.minimum(a, b); M = np.maximum(a, b)
     return m - tau*np.log1p(np.exp(-(M-m)/max(tau,1e-9)))
 
-def embedding_field(name, xx, yy, kappa_like,
-                    ellipse_q=0.80, ellipse_min_ar=0.5,
-                    dual_min_sep=40, dual_blend="softmin", dual_tau=0.08):
+# ---- Embedding field (three modes) ----
+def embedding_field(name, xx, yy, kappa_like):
     ny, nx = kappa_like.shape
+
     if name == "radial-from-peak":
         cy, cx = np.unravel_index(np.argmax(kappa_like), kappa_like.shape)
         Xc = (xx - cx) / (nx/2); Yc = (yy - cy) / (ny/2)
         return np.sqrt(Xc**2 + Yc**2) + 1e-6
+
     elif name == "elliptic-from-moments":
-        mask = _binary_top_quantile(kappa_like, ellipse_q)
-        cy, cx, a, b, ang = _ellipse_from_mask(mask, min_ar=ellipse_min_ar)
+        mask = _binary_top_quantile(kappa_like, PRIMARY["ELLIPSE_Q_FOR_MASK"])
+        cy, cx, a, b, ang = _ellipse_from_mask(mask)
         return _mahalanobis_r(yy, xx, cy, cx, a, b, ang)
+
     elif name == "dual-from-twopeaks":
-        peaks = _top_two_peaks(kappa_like, min_sep=dual_min_sep)
+        peaks = _top_two_peaks(kappa_like, min_sep=PRIMARY["DUAL_MIN_SEP_PX"])
         if len(peaks) == 1:
-            cy, cx = peaks[0]; Xc = (xx - cx)/(nx/2); Yc = (yy - cy)/(ny/2)
+            cy, cx = peaks[0]
+            Xc = (xx - cx)/(nx/2); Yc = (yy - cy)/(ny/2)
             return np.sqrt(Xc**2 + Yc**2) + 1e-6
         (y1,x1), (y2,x2) = peaks[0], peaks[1]
         r1 = np.sqrt(((xx - x1)/(nx/2))**2 + ((yy - y1)/(ny/2))**2) + 1e-6
         r2 = np.sqrt(((xx - x2)/(nx/2))**2 + ((yy - y2)/(ny/2))**2) + 1e-6
-        return _softmin(r1, r2, tau=dual_tau) if dual_blend=="softmin" else np.minimum(r1, r2)
+        return _softmin(r1, r2, tau=PRIMARY["DUAL_TAU"]) if PRIMARY["DUAL_BLEND"]=="softmin" else np.minimum(r1, r2)
+
     else:
-        raise ValueError("EMBEDDING must be: 'radial-from-peak'|'elliptic-from-moments'|'dual-from-twopeaks'")
+        raise ValueError("EMBEDDING must be: 'radial-from-peak' | 'elliptic-from-moments' | 'dual-from-twopeaks'")
 
 # ---- Ridge & F1 ----
 def ridge_response(arr, sigmas=(1.5,3.0,6.0)):
     R=np.zeros_like(arr)
-    for s in sigmas: R=np.maximum(R, -gaussian_laplace(arr, s))
+    for s in sigmas:
+        R=np.maximum(R, -gaussian_laplace(arr, s))
     return R
 
-def ridge_keypoints(arr, sigmas=(1.5,3.0,6.0), q=0.97, min_sep=14, max_pts=120):
-    R = ridge_response(arr, sigmas)
+def ridge_keypoints(arr, q=0.97, min_sep=14, max_pts=120):
+    R = ridge_response(arr, PRIMARY["RIDGE_SIGMAS"])
     thr = np.quantile(R, q)
     mask = R >= thr
     skel = skeletonize(mask.astype(bool))
@@ -244,18 +275,21 @@ def component_keep_mask_and_count(binary, min_size=100):
         for i,sl in enumerate(sls, start=1):
             if sl is None: continue
             mask=(lab[sl]==i); sz=int(mask.sum())
-            if sz>=min_size: keep[sl]|=mask; count+=1
+            if sz>=min_size:
+                keep[sl]|=mask; count+=1
     return keep, count
 
-# ---- Core runner（仅用 CFG，不引用外部 PRIMARY，避免 KeyError）----
+# ---------------- Main per-dataset pipeline ----------------
 def run_one(name, url, CFG):
     if not url.strip():
         print(f"[SKIP] {name}: URL not provided.\n"); return None
 
+    # Load κ
     with fits.open(url) as hdul:
         data = hdul[0].data if hdul[0].data is not None else hdul[1].data
         kappa = np.array(data, dtype=np.float64)
 
+    # Resample / preprocess
     if kappa.shape != (CFG["TARGET_N"], CFG["TARGET_N"]):
         zy=CFG["TARGET_N"]/kappa.shape[0]; zx=CFG["TARGET_N"]/kappa.shape[1]
         kappa=zoom(kappa,(zy,zx),order=1)
@@ -267,14 +301,12 @@ def run_one(name, url, CFG):
     W2D=tukey2d(kappa.shape, alpha=CFG["TUKEY_ALPHA"])
     BP_MASK=bandpass_mask(kappa.shape, *CFG["BANDPASS"])
 
-    U=embedding_field(CFG["EMBEDDING"], xx, yy, kappa,
-                      ellipse_q=CFG["ELLIPSE_Q_FOR_MASK"],
-                      ellipse_min_ar=CFG["ELLIPSE_MIN_AXIS_RATIO"],
-                      dual_min_sep=CFG["DUAL_MIN_SEP_PX"],
-                      dual_blend=CFG["DUAL_BLEND"], dual_tau=CFG["DUAL_TAU"])
+    # θ(U)
+    U=embedding_field(CFG["EMBEDDING"], xx, yy, kappa)
     theta=theta_exact_from_U(U, CFG["T_LO"], CFG["T_HI"], CFG["THETA_GRID_N"], mp_dps=50)
     theta_bp=bandpass_apply(theta * W2D, BP_MASK)
 
+    # κ_pred
     kappa_w = kappa * W2D
     kpred0  = -laplacian_2d(theta_bp)
     if CFG["SIGMA_SMOOTH_PRED"]>0: kpred0=gaussian_filter(kpred0, CFG["SIGMA_SMOOTH_PRED"])
@@ -283,7 +315,7 @@ def run_one(name, url, CFG):
     kpred_bp = gaussian_filter(kpred_bp, 1.0)
     kappa_bp = zscore(kappa_bp); kpred_bp=zscore(kpred_bp)
 
-    # controls
+    # Controls (same aperture)
     def shuffle_phase(f,seed=0):
         F=spfft.fft2(f); A=np.abs(F); rng=np.random.default_rng(seed)
         phase=np.exp(1j*2*np.pi*rng.random(f.shape)); return spfft.ifft2(A*phase).real
@@ -299,7 +331,7 @@ def run_one(name, url, CFG):
     kpred_roll = gaussian_filter(kpred_roll,1.0); kpred_rot=gaussian_filter(kpred_rot,1.0)
     kpred_roll = zscore(kpred_roll); kpred_rot=zscore(kpred_rot)
 
-    # metrics
+    # Metrics: γ² + JK; best-shift; ridge-F1 with scale scan
     from scipy.ndimage import gaussian_filter as gf
     def metrics_bp(kd_bp,kp_bp):
         kd2=kd_bp-gf(kd_bp,6); kp2=kp_bp-gf(kp_bp,6)
@@ -311,12 +343,12 @@ def run_one(name, url, CFG):
     M_best=metrics_bp(kappa_bp,kpred_bp);  M_shuf=metrics_bp(kappa_bp,kpred_sh)
     M_roll=metrics_bp(kappa_bp,kpred_roll); M_rot=metrics_bp(kappa_bp,kpred_rot)
 
-    # Ridge-F1 after alignment + scale-scan
+    # Ridge-F1: best-shift + isotropic scale scan
     dy, dx = M_best["shift"]; kd2 = M_best["kd2"]
     def _scale_image(img, s):
-        from scipy.ndimage import zoom as _zoom
+        from scipy.ndimage import zoom
         h, w = img.shape
-        z = _zoom(img, s, order=1)
+        z = zoom(img, s, order=1)
         hh, ww = z.shape
         out = np.zeros_like(img)
         y0 = max(0, (h - hh)//2); x0 = max(0, (w - ww)//2)
@@ -325,92 +357,81 @@ def run_one(name, url, CFG):
         out[y0:y1, x0:x1] = z[zy0:zy0+(y1-y0), zx0:zx0+(x1-x0)]
         return out
     best_F1 = 0.0
-    for s in CFG["AFFINE_SCALE_SCAN"]:
+    for s in PRIMARY["AFFINE_SCALE_SCAN"]:
         kp2_s = _scale_image(M_best["kp2"], s)
         kp2_aligned = np.roll(np.roll(kp2_s, dy, axis=0), dx, axis=1)
-        pts_d = ridge_keypoints(kd2, sigmas=CFG["RIDGE_SIGMAS"], q=CFG["RIDGE_Q"], min_sep=CFG["RIDGE_MIN_SEP"])
-        pts_p = ridge_keypoints(kp2_aligned, sigmas=CFG["RIDGE_SIGMAS"], q=CFG["RIDGE_Q"], min_sep=CFG["RIDGE_MIN_SEP"])
-        F1_s  = f1_hungarian_points(pts_d, pts_p, R=CFG["F1_MATCH_RADIUS"])
+        pts_d = ridge_keypoints(kd2, q=PRIMARY["RIDGE_Q"], min_sep=PRIMARY["RIDGE_MIN_SEP"])
+        pts_p = ridge_keypoints(kp2_aligned, q=PRIMARY["RIDGE_Q"], min_sep=PRIMARY["RIDGE_MIN_SEP"])
+        F1_s  = f1_hungarian_points(pts_d, pts_p, R=PRIMARY["F1_MATCH_RADIUS"])
         best_F1 = max(best_F1, F1_s)
     F1_best = best_F1
 
-    # 对照 F1（不对齐）
+    # Control F1s (no alignment)
     def ridge_F1_noalign(kd2, kp2):
-        A = ridge_keypoints(kd2, sigmas=CFG["RIDGE_SIGMAS"], q=CFG["RIDGE_Q"], min_sep=CFG["RIDGE_MIN_SEP"])
-        B = ridge_keypoints(kp2, sigmas=CFG["RIDGE_SIGMAS"], q=CFG["RIDGE_Q"], min_sep=CFG["RIDGE_MIN_SEP"])
-        return f1_hungarian_points(A,B, R=CFG["F1_MATCH_RADIUS"])
+        A = ridge_keypoints(kd2, q=PRIMARY["RIDGE_Q"], min_sep=PRIMARY["RIDGE_MIN_SEP"])
+        B = ridge_keypoints(kp2, q=PRIMARY["RIDGE_Q"], min_sep=PRIMARY["RIDGE_MIN_SEP"])
+        return f1_hungarian_points(A,B, R=PRIMARY["F1_MATCH_RADIUS"])
     F1_sh = ridge_F1_noalign(M_shuf["kd2"], M_shuf["kp2"])
     F1_ro = ridge_F1_noalign(M_roll["kd2"], M_roll["kp2"])
     F1_rt = ridge_F1_noalign(M_rot["kd2"],  M_rot["kp2"])
 
-    # 幂谱 sanity
+    # Morphology (same band)
+    morphA_raw,thrA=binarize_by_quantile(kappa_bp,q=PRIMARY["MORPH_Q"])
+    morphB_raw,thrB=binarize_by_quantile(kpred_bp,q=PRIMARY["MORPH_Q"])
+    morphA_raw=binary_opening(morphA_raw, iterations=1); morphB_raw=binary_opening(morphB_raw, iterations=1)
+    bA, compA = component_keep_mask_and_count(morphA_raw, PRIMARY["MORPH_MIN_SIZE"])
+    bB, compB = component_keep_mask_and_count(morphB_raw, PRIMARY["MORPH_MIN_SIZE"])
+    perA=perimeter_length(bA); perB=perimeter_length(bB); areaA=float(bA.sum()); areaB=float(bB.sum())
+
+    # Power spectra (sanity)
     def fit_slope(k,P, lo=0.10,hi=0.25):
         n=len(k); i0=int(n*lo); i1=int(n*hi); kk=k[i0:i1].astype(float); pp=P[i0:i1].astype(float)
         return float(np.polyfit(np.log(kk+1e-9), np.log(pp+1e-12), 1)[0])
     kt,Pt=isotropic_ps(zscore(theta_bp)); kp,Pp=isotropic_ps(kpred_bp)
-    s_theta=fit_slope(kt,Pt, *CFG["SLOPE_FIT_FRAC"]); s_pred=fit_slope(kp,Pp, *CFG["SLOPE_FIT_FRAC"])
+    s_theta=fit_slope(kt,Pt,*PRIMARY["SLOPE_FIT_FRAC"]); s_pred=fit_slope(kp,Pp,*PRIMARY["SLOPE_FIT_FRAC"])
 
-    # 快速图
-    plt.figure(figsize=(5.4,4.4)); plt.imshow(kappa_bp, origin='lower'); plt.colorbar(); plt.title(f"{name}: κ (bandpassed,z)"); plt.tight_layout(); plt.show()
-    plt.figure(figsize=(5.4,4.4)); plt.imshow(kpred_bp, origin='lower'); plt.colorbar(); plt.title("κ_pred ∝ −∇²θ(U) (bandpassed,z)"); plt.tight_layout(); plt.show()
+    # Plots
+    plt.figure(figsize=(5.6,4.6)); plt.imshow(kappa_bp, origin='lower'); plt.colorbar(); plt.title(f"{name}: κ (bandpassed,z)"); plt.tight_layout(); plt.show()
+    plt.figure(figsize=(5.6,4.6)); plt.imshow(kpred_bp, origin='lower'); plt.colorbar(); plt.title("κ_pred ∝ −∇²θ(U) (bandpassed,z)"); plt.tight_layout(); plt.show()
     kd,Pd=isotropic_ps(kappa_bp); kp2,Pp2=isotropic_ps(kpred_bp); kx,Px=isotropic_cross_ps(kappa_bp,kpred_bp)
     c=min(len(Pd),len(Pp2),len(Px)); Pd,Pp2,Px=Pd[:c],Pp2[:c],Px[:c]; g2_curve=(Px**2)/(np.maximum(Pd,1e-20)*np.maximum(Pp2,1e-20))
     kd,Pd=isotropic_ps(kappa_bp); kp3,Pp3=isotropic_ps(kpred_sh); kx,Px=isotropic_cross_ps(kappa_bp,kpred_sh)
     c2=min(len(Pd),len(Pp3),len(Px)); Pd,Pp3,Px=Pd[:c2],Pp3[:c2],Px[:c2]; g2_sh_curve=(Px**2)/(np.maximum(Pd,1e-20)*np.maximum(Pp3,1e-20))
-    plt.figure(figsize=(5.4,4.4)); plt.semilogy(np.arange(len(g2_curve)), g2_curve, label="γ²(data×pred)"); plt.semilogy(np.arange(len(g2_sh_curve)), g2_sh_curve, label="γ²(shuffled)"); plt.legend(); plt.title("Coherence vs k"); plt.tight_layout(); plt.show()
+    plt.figure(figsize=(5.6,4.6)); plt.semilogy(np.arange(len(g2_curve)), g2_curve, label="γ²(data×pred)"); plt.semilogy(np.arange(len(g2_sh_curve)), g2_sh_curve, label="γ²(shuffled)"); plt.legend(); plt.title("Coherence vs k"); plt.tight_layout(); plt.show()
 
-    # 汇总打印（全部用 CFG，避免 KeyError）
+    # PASS flags
+    def pass_flag(real,ctrl_max,thr): return (real>=thr) and (real>max(ctrl_max,1e-9)*1.5)
+    ok_gamma = pass_flag(M_best["gamma2"], max(M_shuf["gamma2"],M_roll["gamma2"],M_rot["gamma2"]), THRESH["gamma2_min"])
+    ctrl_F1_max = max(F1_sh,F1_ro,F1_rt)
+    ok_f1   = pass_flag(F1_best, ctrl_F1_max, THRESH["f1_min"])
+    bonus_r = (M_best["r_best"] >= THRESH["r_bonus"])
+
+    # Print summary
     print("\n=== REPLICATION (locked params) ===")
     print(f"Dataset: {name}")
-    print(f"Embed={CFG['EMBEDDING']}  band={CFG['BANDPASS']}  θgrid={CFG['THETA_GRID_N']}  "
-          f"smooth(data,pred)=({CFG['SIGMA_SMOOTH_DATA']},{CFG['SIGMA_SMOOTH_PRED']})")
+    print(f"Embed={PRIMARY['EMBEDDING']}  band={PRIMARY['BANDPASS']}  θgrid={PRIMARY['THETA_GRID_N']}  "
+          f"smooth(data,pred)=({PRIMARY['SIGMA_SMOOTH_DATA']},{PRIMARY['SIGMA_SMOOTH_PRED']})")
     print(f"[BEST]     r={M_best['r']:+.3f}, r_best={M_best['r_best']:+.3f}@{M_best['shift']}, "
           f"γ̄²={M_best['gamma2']:.3f} [JK {M_best['gamma2_jk'][0]:.3f} CI {M_best['gamma2_jk'][1]:.3f},{M_best['gamma2_jk'][2]:.3f}]")
     print(f"[BEST-aligned] Ridge F1(one-to-one) = {F1_best:.3f}")
     print(f"[CTRL]  γ̄²: shuffle={M_shuf['gamma2']:.3f} roll={M_roll['gamma2']:.3f} rot90={M_rot['gamma2']:.3f}")
     print(f"[CTRL]  F1 : shuffle={F1_sh:.3f} roll={F1_ro:.3f} rot90={F1_rt:.3f}")
     print(f"[Sanity] slope(P_theta)={s_theta:.2f}, slope(P_pred)={s_pred:.2f}, diff={s_pred-s_theta:.2f}")
+    print(f"[Morph @q={PRIMARY['MORPH_Q']:.2f}, min_size={PRIMARY['MORPH_MIN_SIZE']}] "
+          f"comps: data={compA} pred={compB}; "
+          f"area(px): data={areaA:.0f} pred={areaB:.0f}; "
+          f"perim(px): data={perA:.0f} pred={perB:.0f}")
+    if PRIMARY['MPP'] is not None:
+        print(f"          area(Mpc^2): data={areaA*PRIMARY['MPP']**2:.2f} pred={areaB*PRIMARY['MPP']**2:.2f}; "
+              f"perim(Mpc): data={perA*PRIMARY['MPP']:.2f} pred={perB*PRIMARY['MPP']:.2f}")
+    print(f"\nPASS: γ̄²≥{THRESH['gamma2_min']}? {ok_gamma} | Ridge-F1≥{THRESH['f1_min']} & ≥1.5×ctrl? {ok_f1} | bonus r_best≥{THRESH['r_bonus']}? {bonus_r}")
+    print("Done.\n")
 
-    return dict(
-        name=name, embed=CFG["EMBEDDING"],
-        gamma2=float(M_best["gamma2"]), gamma2_jk=M_best["gamma2_jk"],
-        r=float(M_best["r"]), r_best=float(M_best["r_best"]), shift=M_best["shift"],
-        F1=float(F1_best),
-        g2_ctrl=(float(M_shuf["gamma2"]), float(M_roll["gamma2"]), float(M_rot["gamma2"])),
-        F1_ctrl=(float(F1_sh), float(F1_ro), float(F1_rt))
-    )
+    return dict(metrics=(M_best,M_shuf,M_roll,M_rot), F1_best=F1_best, F1_ctrl=(F1_sh,F1_ro,F1_rt))
 
-# ---------------- 两轮跑：椭圆 → 双峰，并汇总 ----------------
-def run_with_embedding(embed_name):
-    CFG = BASE_CFG.copy(); CFG["EMBEDDING"] = embed_name
-    out=[]
-    print(f"\n\n===== RUN: EMBEDDING = {embed_name} =====")
-    for name, url in DATASETS:
-        out.append(run_one(name, url, CFG))
-    return out
+# ---------------- Run all datasets (locked params) ----------------
+for (name, url) in DATASETS:
+    _ = run_one(name, url, PRIMARY)
 
-res_ell  = run_with_embedding("elliptic-from-moments")
-res_dual = run_with_embedding("dual-from-twopeaks")
+print("提示：仅改 PRIMARY['EMBEDDING'] 为 'elliptic-from-moments' 或 'dual-from-twopeaks'，其余参数不变，再次运行即可完成“不改参跨天区 + 改几何假设”的鲁棒性检验。")
 
-def _rowify(res_list, tag):
-    lines=[]
-    for r in res_list:
-        if r is None: continue
-        gmu, (gmu_jk, lo, hi) = r["gamma2"], r["gamma2_jk"]
-        shu, rol, rot = r["g2_ctrl"]
-        f1 = r["F1"]; f1c = r["F1_ctrl"]
-        lines.append(f"{r['name']:<15s} {tag:<12s}  γ̄²={gmu:>.3f} [JK {gmu_jk:>.3f} CI {lo:>.3f},{hi:>.3f}]  "
-                     f"F1={f1:>.3f}  |  ctrl γ̄²(sh,ro,rt)=({shu:.3f},{rol:.3f},{rot:.3f})  "
-                     f"ctrl F1(sh,ro,rt)=({f1c[0]:.3f},{f1c[1]:.3f},{f1c[2]:.3f})")
-    return "\n".join(lines)
-
-print("\n\n=== SUMMARY TABLE ===")
-print(_rowify(res_ell,  "ELLIPTIC"))
-print(_rowify(res_dual, "DUAL-2PEAKS"))
-
-plt.figure(figsize=(6,4))
-plt.text(0.5,0.5,"Done.\nSee printed results above.", ha="center", va="center", fontsize=14)
-plt.title("ζ–U Eq.(5) — Elliptic & Dual embeddings")
-plt.axis("off"); plt.tight_layout(); plt.show()
-
-print("提示：若要进一步冲 Ridge-F1≥0.10，可仅微调 AFFINE_SCALE_SCAN 或 RIDGE_Q / RIDGE_MIN_SEP（评估容差），其余参数不变。")
