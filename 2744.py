@@ -1,275 +1,377 @@
-# ============================================================
-#  Abell 2744 (real κ-map) → strong-field refractive test
-#  - Downloads CATS v4 kappa FITS
-#  - Solves linear vs nonlinear PDE for φ=ln n
-#  - Computes deflection α = ∇φ (2D proxy), compares Δα
-#  - Nonlinear uses saturated |∇φ|^4 and 2/3 de-aliasing
-#  - Shows plots (plt.show) and prints artifact paths at end
-# ============================================================
-import os, urllib.request, numpy as np, numpy.fft as fft, matplotlib.pyplot as plt
-import pandas as pd
+# ==========================================================
+# ζ–U Binding (Eq.5) — Cross-coherence + Morphology + Replication
+# Minimal integrated changes:
+#  (A) κ_pred 轻平滑 σ=2.0（稳定形态）+ 带通后再轻抑碎 σ=1.0
+#  (B) 形态学：同分位阈值 q=0.90 + 删除 tiny components (≥50 px)
+#  (C) 峰在同一带宽内提取；best-shift 对齐后做“一对一（Hungarian）F1”评估
+#  (D) 控制组（phase-shuffle / U-roll / U-rot90）同口径
+#  Deps: numpy, matplotlib, astropy, scipy, mpmath
+# ==========================================================
 
-# ---------- Paths & I/O ----------
-OUT = "/content/out"; os.makedirs(OUT, exist_ok=True)
-FITS_PATH = "/content/kappa_map.fits"
-URL = "https://archive.stsci.edu/pub/hlsp/frontier/abell2744/models/cats/v4/hlsp_frontier_model_abell2744_cats_v4_kappa.fits"
-
-# Astropy install (Colab usually has it; keep fallback)
-try:
-    from astropy.io import fits
-except Exception:
-    import sys, subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "astropy"])
-    from astropy.io import fits
-
-if not os.path.exists(FITS_PATH):
-    print("Downloading:", URL)
-    urllib.request.urlretrieve(URL, FITS_PATH)
-else:
-    print("File exists:", FITS_PATH)
-
-# ---------- Load κ map ----------
-with fits.open(FITS_PATH) as hdul:
-    # Try to find first image HDU with data
-    data = None
-    for h in hdul:
-        if hasattr(h, "data") and isinstance(h.data, np.ndarray):
-            data = h.data.astype(np.float64)
-            if data.ndim == 2:
-                break
-    assert data is not None and data.ndim == 2, "No 2D image in FITS!"
-
-# Replace NaNs/infs
-m = np.nanmedian(data)
-data = np.nan_to_num(data, nan=m, posinf=m, neginf=m)
-
-# Center crop to power-of-two square for FFT friendliness
-H, W = data.shape
-S = min(H, W)
-# choose a manageable power-of-two (e.g., 512)
-target = 512 if S >= 512 else (256 if S >= 256 else 128)
-r0 = (H - target)//2; c0 = (W - target)//2
-kappa_map = data[r0:r0+target, c0:c0+target].copy()
-N = kappa_map.shape[0]
-Lx = Ly = 1.0  # normalized box (arcsec scale factor not needed for demo)
-
-# ---------- Spectral operators ----------
-kx = 2*np.pi*fft.fftfreq(N, d=Lx/N)
-ky = 2*np.pi*fft.fftfreq(N, d=Ly/N)
-KX, KY = np.meshgrid(kx, ky, indexing="ij")
-K2 = KX**2 + KY**2
-K2[0,0] = 1.0  # avoid zero-div in Poisson inversions
-
-def fft2(a):  return fft.fft2(a)
-def ifft2(A): return np.real(fft.ifft2(A))
-
-def grad(phi):
-    Ph = fft2(phi)
-    gx = ifft2(1j*KX*Ph); gy = ifft2(1j*KY*Ph)
-    return gx, gy
-
-def lap(phi):
-    return ifft2(-K2*fft2(phi))
-
-def invlap(rhs):
-    Rh = fft2(rhs); Ph = Rh/(-K2); Ph[0,0] = 0.0
-    return ifft2(Ph)
-
-# 2/3 de-aliasing filter (Orszag)
-def dealias_23(Ahat):
-    nx = N; ny = N
-    kcx = int(nx/3); kcy = int(ny/3)
-    B = Ahat.copy()
-    B[kcx:-kcx,:] = 0.0
-    B[:,kcy:-kcy] = 0.0
-    return B
-
-def filter_23(phi):
-    return ifft2(dealias_23(fft2(phi)))
-
-# ---------- Build ρ from κ (proxy) ----------
-# zero-mean source; scale factor absorbed to kappa_phys=1 for demo
-rho = kappa_map - np.mean(kappa_map)
-rho = rho - np.mean(rho)
-kappa_phys = 1.0
-
-# ---------- Linear φ (weak-field baseline) ----------
-phi_lin = invlap(-kappa_phys*rho)
-phi_lin -= np.mean(phi_lin)
-
-# ---------- Nonlinearity β(x) from gradient proxy + soft saturation ----------
-# Build a seed from linear gradient for β map
-gx0, gy0 = grad(phi_lin)
-g2_seed = gx0*gx0 + gy0*gy0
-p95 = np.percentile(g2_seed, 95)
-BETA0 = 0.6  # global strength (tunable)
-beta_map = BETA0 * (g2_seed / (p95 + 1e-12))
-beta_map = np.clip(beta_map, 0.0, BETA0)
-# Smooth β by 1-step 5-point average to avoid checkerboarding
-beta_map = 0.5*(beta_map + (np.roll(beta_map,1,0)+np.roll(beta_map,-1,0)+np.roll(beta_map,1,1)+np.roll(beta_map,-1,1))/4.0)
-
-# Soft saturation scale for |∇φ|^2
-Lambda2 = np.percentile(g2_seed, 98) + 1e-12
-
-def N_soft(g2):
-    # saturated (|∇φ|^2)^2 -> (g2/(1+g2/Lambda2))^2
-    s = g2/(1.0 + g2/Lambda2)
-    return s*s
-
-# ---------- Strong-field solve: ∇²φ + β(x) * N_soft(|∇φ|^2) = -κ_phys ρ ----------
-def solve_strong(rho, beta_map, steps=6, iters=250, tol=2e-6, relax=0.62, do_filter=True):
-    phi = invlap(-kappa_phys*rho)  # start from linear
-    phi -= np.mean(phi)
-    residuals = []
-    for s in range(1, steps+1):
-        w = s/steps
-        beta_eff = w*beta_map
-        for it in range(iters):
-            gx, gy = grad(phi)
-            g2 = gx*gx + gy*gy
-            rhs = -kappa_phys*rho - beta_eff * N_soft(g2)
-            phi_new = invlap(rhs)
-            if do_filter:
-                phi_new = filter_23(phi_new)
-            phi = (1.0 - relax)*phi + relax*phi_new
-            phi -= np.mean(phi)
-            F = lap(phi) + beta_eff * N_soft(g2) + kappa_phys*rho
-            res = float(np.sqrt(np.mean(F*F)))
-            residuals.append(res)
-            if res < tol:
-                break
-    return phi, np.array(residuals)
-
-phi_non, res_hist = solve_strong(rho, beta_map, steps=6, iters=260, tol=2e-6, relax=0.6, do_filter=True)
-
-# ---------- Deflection fields & diagnostics ----------
-def deflection_xy(phi):
-    # In this refractive model demo, take α ≈ ∇φ as 2D proxy
-    return grad(phi)
-
-ax_lin_x, ax_lin_y = deflection_xy(phi_lin)
-ax_non_x, ax_non_y = deflection_xy(phi_non)
-
-delta_ax = ax_non_x - ax_lin_x
-delta_ay = ax_non_y - ax_lin_y
-delta_mag = np.sqrt(delta_ax**2 + delta_ay**2)
-
-# line-cut through center
-i0 = N//2
-b_axis = np.linspace(-0.5, 0.5, N)
-cut_lin = ax_lin_x[i0,:]
-cut_non = ax_non_x[i0,:]
-cut_dlt = cut_non - cut_lin
-
-# ---------- Nonlinear Gauss closure (square shells) ----------
-# Flux + mass + nonlinear ≈ 0  (2D proxy)
-dx = Lx/N; dy = Ly/N; dA = dx*dy
-
-def square_closure(phi, rho, beta_map, half_sizes):
-    # Use φ_non for closure check (with its β)
-    gx, gy = grad(phi)
-    rels, fluxes, masses, Nterms = [], [], [], []
-    def sample(arr, xi, yi):
-        # bilinear periodic sampling
-        ii = (xi* N / Lx) % N; jj = (yi* N / Ly) % N
-        i0 = np.floor(ii).astype(int); j0 = np.floor(jj).astype(int)
-        di = ii - i0; dj = jj - j0
-        i1 = (i0+1) % N; j1 = (j0+1) % N
-        return ((1-di)*(1-dj)*arr[i0,j0] + di*(1-dj)*arr[i1,j0] +
-                (1-di)*dj*arr[i0,j1] + di*dj*arr[i1,j1])
-    cx = cy = 0.5*Lx
-    m = 2048
-    Xg = np.linspace(0, Lx, N, endpoint=False); Yg = np.linspace(0, Ly, N, endpoint=False)
-    X, Y = np.meshgrid(Xg, Yg, indexing='ij')
-
-    for a in half_sizes:
-        t = np.linspace(-a, a, m, endpoint=False)
-        xl, yl = (cx - a)*np.ones_like(t), cy + t
-        xr, yr = (cx + a)*np.ones_like(t), cy + t
-        xb, yb = cx + t, (cy - a)*np.ones_like(t)
-        xt, yt = cx + t, (cy + a)*np.ones_like(t)
-        gx_l = sample(gx, xl, yl); gy_l = sample(gy, xl, yl)
-        gx_r = sample(gx, xr, yr); gy_r = sample(gy, xr, yr)
-        gx_b = sample(gx, xb, yb); gy_b = sample(gy, xb, yb)
-        gx_t = sample(gx, xt, yt); gy_t = sample(gy, xt, yt)
-        # outward normals: left(-x), right(+x), bottom(-y), top(+y)
-        flux = (np.trapezoid(-gx_l, t) + np.trapezoid(+gx_r, t) +
-                np.trapezoid(-gy_b, t) + np.trapezoid(+gy_t, t))
-        # area terms
-        mask = (np.abs((X-cx))<=a) & (np.abs((Y-cy))<=a)
-        mass = rho[mask].sum()*dA
-        gxv, gyv = gx[mask], gy[mask]
-        Nterm = (beta_map[mask] * N_soft(gxv*gxv+gyv*gyv)).sum()*dA
-        clos = flux + kappa_phys*mass + Nterm
-        denom = np.abs(flux)+np.abs(kappa_phys*mass)+np.abs(Nterm)+1e-12
-        rels.append(np.abs(clos)/denom)
-        fluxes.append(flux); masses.append(mass); Nterms.append(Nterm)
-    return (np.array(rels), np.array(fluxes),
-            np.array(masses), np.array(Nterms))
-
-half_sizes = np.linspace(0.06*Lx, 0.35*Lx, 24)
-rels, Fv, Mv, Nv = square_closure(phi_non, rho, beta_map, half_sizes)
-
-# ---------- Plots ----------
-plt.figure(figsize=(6.4,4))
-plt.semilogy(res_hist)
-plt.xlabel("Iteration"); plt.ylabel("RMS residual")
-plt.title("Strong-field residual (Abell 2744)")
-plt.tight_layout(); plt.savefig(f"{OUT}/residual_abell2744.png", dpi=160); plt.show()
-
-plt.figure(figsize=(6,5))
-plt.imshow(kappa_map.T, origin="lower", cmap="magma")
-plt.colorbar(label="κ (CATS v4)")
-plt.title("Abell 2744: κ-map (center crop)")
-plt.tight_layout(); plt.savefig(f"{OUT}/abell2744_kappa.png", dpi=160); plt.show()
-
-plt.figure(figsize=(6,5))
-plt.imshow(delta_mag.T, origin="lower", cmap="viridis")
-plt.colorbar(label="|Δα| = |∇φ_NL - ∇φ_Lin|")
-plt.title("Strong-field correction map |Δα|")
-plt.tight_layout(); plt.savefig(f"{OUT}/delta_alpha_map.png", dpi=160); plt.show()
-
-plt.figure(figsize=(6.4,4))
-plt.plot(b_axis, cut_lin, label="α_x (linear)")
-plt.plot(b_axis, cut_non, label="α_x (nonlinear)")
-plt.plot(b_axis, cut_dlt, label="Δα_x", linestyle="--")
-plt.xlabel("normalized impact parameter (center line)")
-plt.ylabel("α_x")
-plt.title("Line cut through center (x-direction)")
-plt.legend(); plt.tight_layout(); plt.savefig(f"{OUT}/linecut_alpha.png", dpi=160); plt.show()
-
-plt.figure(figsize=(6.4,3.6))
-plt.plot(half_sizes, rels)
-plt.xlabel("half-size (box)")
-plt.ylabel("relative closure")
-plt.title("Nonlinear Gauss closure (Abell 2744)")
-plt.tight_layout(); plt.savefig(f"{OUT}/closure_curve.png", dpi=160); plt.show()
-
-# ---------- CSVs ----------
-pd.DataFrame({
-    "half_size": half_sizes,
-    "rel_closure": rels,
-    "flux": Fv,
-    "mass_term": kappa_phys*Mv,
-    "nonlinear_term": Nv
-}).to_csv(f"{OUT}/closure_abell2744.csv", index=False)
-
-# Aggregate Δα stats
-stats = {
-    "delta_alpha_mean": float(np.mean(delta_mag)),
-    "delta_alpha_median": float(np.median(delta_mag)),
-    "delta_alpha_p95": float(np.percentile(delta_mag,95))
+# ---------- Locked (PRIMARY) settings ----------
+PRIMARY = {
+    "EMBEDDING": "radial-from-peak",
+    "T_LO": 80.0, "T_HI": 6000.0,
+    "THETA_GRID_N": 1000,
+    "TARGET_N": 512,
+    "SIGMA_SMOOTH_DATA": 1.0,     # κ data pre-smooth
+    "SIGMA_SMOOTH_PRED": 2.0,     # κ_pred 初步轻平滑（形态稳）
+    "TUKEY_ALPHA": 0.20,
+    "BANDPASS": (0.08, 0.30),
+    "SLOPE_FIT_FRAC": (0.08, 0.30),
+    "TOP_N_PEAKS": 80,            # 更稀疏的主干峰
+    "PEAK_MATCH_RADIUS": 10,      # 峰匹配半径
+    "PEAK_MIN_SEP": 12,           # 峰间最小间距（LoG 最大池化）
+    "BEST_SHIFT_MAX": 6,          # best-shift 搜索窗口
+    "MORPH_Q": 0.90,              # 同分位阈值
+    "MORPH_MIN_SIZE": 50,         # 删除 tiny 斑块（px）
+    "MPP": None                   # 可选 Mpc/pixel（A2744 ~0.102）
 }
-pd.DataFrame([stats]).to_csv(f"{OUT}/delta_alpha_stats.csv", index=False)
 
-# ---------- Final print ----------
-print("Artifacts saved in:", OUT)
-print(" - κ map crop:          ", f"{OUT}/abell2744_kappa.png")
-print(" - residual history:    ", f"{OUT}/residual_abell2744.png")
-print(" - |Δα| map:            ", f"{OUT}/delta_alpha_map.png")
-print(" - α line cut:          ", f"{OUT}/linecut_alpha.png")
-print(" - closure curve:       ", f"{OUT}/closure_curve.png")
-print(" - CSVs:")
-print("   • closure:           ", f"{OUT}/closure_abell2744.csv")
-print("   • Δα summary stats:  ", f"{OUT}/delta_alpha_stats.csv")
+THRESH = {"gamma2_min": 0.05, "f1_min": 0.10, "r_bonus": 0.03}
+
+# --------- DATASETS（SECOND_URL 用于不改参复现）---------
+A2744_URL = "https://archive.stsci.edu/pub/hlsp/frontier/abell2744/models/cats/v4/hlsp_frontier_model_abell2744_cats_v4_kappa.fits"
+SECOND_URL = ""  # 粘贴 MACS J0416 / A370 的 CATS v4 kappa FITS 直链即可，不改其他参数
+
+# ------------- Imports / installs -------------
+import sys, subprocess, warnings
+warnings.filterwarnings("ignore")
+def _pip(x): subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + x)
+try:
+    import numpy as np, matplotlib.pyplot as plt
+    from astropy.io import fits
+    from scipy.ndimage import (gaussian_filter, maximum_filter, label, find_objects,
+                               zoom, gaussian_laplace, binary_erosion)
+    from scipy import fft as spfft
+    from scipy.stats import pearsonr
+    from scipy.signal import tukey
+    from scipy.optimize import linear_sum_assignment as hungarian
+except Exception:
+    _pip(["numpy","matplotlib","astropy","scipy"])
+    import numpy as np, matplotlib.pyplot as plt
+    from astropy.io import fits
+    from scipy.ndimage import (gaussian_filter, maximum_filter, label, find_objects,
+                               zoom, gaussian_laplace, binary_erosion)
+    from scipy import fft as spfft
+    from scipy.stats import pearsonr
+    from scipy.signal import tukey
+    from scipy.optimize import linear_sum_assignment as hungarian
+try:
+    import mpmath as mp
+except Exception:
+    _pip(["mpmath"])
+    import mpmath as mp
+
+# ------------- Helpers -------------
+def zscore(a):
+    m = np.mean(a); s = np.std(a) + 1e-12
+    return (a - m) / s
+
+def laplacian_2d(f):
+    return (-4.0*f + np.roll(f,1,0)+np.roll(f,-1,0)+np.roll(f,1,1)+np.roll(f,-1,1))
+
+def tukey2d(shape, alpha=0.20):
+    ny, nx = shape; wy = tukey(ny, alpha=alpha); wx = tukey(nx, alpha=alpha)
+    return np.outer(wy, wx)
+
+def bandpass_mask(shape, kmin_frac=0.08, kmax_frac=0.30):
+    ny, nx = shape
+    ky = spfft.fftfreq(ny)*ny; kx = spfft.fftfreq(nx)*nx
+    KX, KY = np.meshgrid(kx, ky); K = np.sqrt(KX**2 + KY**2)
+    kmax = K.max()
+    return (K >= kmin_frac*kmax) & (K <= kmax_frac*kmax)
+
+def bandpass_apply(f, mask):
+    F = spfft.fft2(f); return spfft.ifft2(F*mask).real
+
+def isotropic_ps(f):
+    F = spfft.fft2(f); P2 = (F*np.conj(F)).real
+    ny, nx = f.shape
+    ky = spfft.fftfreq(ny)*ny; kx = spfft.fftfreq(nx)*nx
+    KX, KY = np.meshgrid(kx, ky); K = np.sqrt(KX**2 + KY**2).astype(int)
+    ps = np.bincount(K.ravel(), P2.ravel()); cnt = np.bincount(K.ravel())
+    ps = ps/np.maximum(cnt,1); k = np.arange(len(ps))
+    return k[1:], ps[1:]
+
+def isotropic_cross_ps(f,g):
+    F = spfft.fft2(f); G = spfft.fft2(g); C = (F*np.conj(G)).real
+    ny, nx = f.shape
+    ky = spfft.fftfreq(ny)*ny; kx = spfft.fftfreq(nx)*nx
+    KX, KY = np.meshgrid(kx, ky); K = np.sqrt(KX**2 + KY**2).astype(int)
+    cs = np.bincount(K.ravel(), C.ravel()); cnt = np.bincount(K.ravel())
+    cs = cs/np.maximum(cnt,1); k = np.arange(len(cs))
+    return k[1:], cs[1:]
+
+def mean_gamma2(a,b, lohi=(0.08,0.30)):
+    kd, Pd = isotropic_ps(a); kp, Pp = isotropic_ps(b); kx, Px = isotropic_cross_ps(a,b)
+    common = min(len(Pd),len(Pp),len(Px))
+    Pd,Pp,Px = Pd[:common],Pp[:common],Px[:common]
+    g2 = (Px**2)/(np.maximum(Pd,1e-20)*np.maximum(Pp,1e-20))
+    i0=int(common*lohi[0]); i1=int(common*lohi[1]); return float(np.mean(g2[i0:i1])), g2, common
+
+def jackknife_gamma2(g2, common, lohi=(0.08,0.30), blocks=10):
+    i0=int(common*lohi[0]); i1=int(common*lohi[1]); seg = g2[i0:i1]; n=len(seg)
+    if n < blocks: mu = float(np.mean(seg)); return mu, (np.nan, np.nan)
+    size = n//blocks; vals=[]
+    for b in range(blocks):
+        mask = np.ones(n,bool); mask[b*size:(b+1)*size] = False
+        vals.append(float(np.mean(seg[mask])))
+    vals=np.array(vals); mu=float(np.mean(vals))
+    std = np.sqrt((blocks-1)/blocks * np.sum((vals-mu)**2))
+    return mu, (mu-1.96*std, mu+1.96*std)
+
+def topN_peaks(arr, N=80, min_sep=12):
+    neigh = maximum_filter(arr, size=min_sep); peaks = (arr==neigh)
+    lab, _ = label(peaks); boxes = find_objects(lab); centers=[]
+    for sl in boxes:
+        ys,xs=sl; sub=arr[ys,xs]
+        iy,ix = np.unravel_index(np.argmax(sub), sub.shape)
+        centers.append((ys.start+iy, xs.start+ix, arr[ys.start+iy, xs.start+ix]))
+    centers.sort(key=lambda t:-t[2]); return centers[:N]
+
+def peaks_multiscale(arr, sigmas=(1.5,3.0,6.0), N=80, min_sep=12):
+    R = np.zeros_like(arr)
+    for s in sigmas: R = np.maximum(R, -gaussian_laplace(arr, s))
+    return topN_peaks(R, N=N, min_sep=min_sep)
+
+def f1_hungarian(peaksA, peaksB, R=10):
+    if len(peaksA)==0 or len(peaksB)==0: return 0.0
+    A = np.array([(y,x) for y,x,_ in peaksA]); B = np.array([(y,x) for y,x,_ in peaksB])
+    D = np.sqrt(((A[:,None,:]-B[None,:,:])**2).sum(2))
+    row, col = hungarian(D)
+    hits = (D[row, col] <= R).sum()
+    prec = hits/len(B); rec = hits/len(A)
+    return 2*prec*rec/(prec+rec+1e-12)
+
+def match_rate(peaksA, peaksB, r_pix=10):
+    if len(peaksA)==0 or len(peaksB)==0: return 0.0
+    A=np.array([(y,x) for y,x,_ in peaksA]); B=np.array([(y,x) for y,x,_ in peaksB])
+    d2=((A[:,None,:]-B[None,:,:])**2).sum(2); dmin=np.sqrt(d2.min(1))
+    return float(np.mean(dmin<=r_pix))
+
+# --------- Exact θ(U) with caching ---------
+THETA_CACHE={}
+def get_theta_grid(t_lo,t_hi,GRID_N, mp_dps=50):
+    key=(float(t_lo),float(t_hi),int(GRID_N),int(mp_dps))
+    if key in THETA_CACHE: return THETA_CACHE[key]
+    mp.mp.dps=mp_dps; t_grid=np.linspace(t_lo,t_hi,GRID_N); vals=[]
+    for tv in t_grid:
+        z=mp.zeta(0.5+1j*tv); vals.append(float(mp.arg(z)))
+    theta_grid=np.unwrap(np.array(vals)); THETA_CACHE[key]=(t_grid,theta_grid); return THETA_CACHE[key]
+
+def theta_exact_from_U(U, t_lo=80.0, t_hi=6000.0, GRID_N=1000, mp_dps=50):
+    Umin,Umax=float(np.min(U)),float(np.max(U))
+    tmap = t_lo + (U-Umin)*(t_hi-t_lo)/(Umax-Umin+1e-12)
+    t_grid,theta_grid=get_theta_grid(t_lo,t_hi,GRID_N,mp_dps)
+    th=np.interp(tmap,t_grid,theta_grid); return th - np.mean(th)
+
+# --- U embedding ---
+def embedding_field(name, xx, yy, kappa_like):
+    ny,nx=kappa_like.shape
+    if name=="radial-from-peak":
+        cy,cx=np.unravel_index(np.argmax(kappa_like),kappa_like.shape)
+        Xc=(xx-cx)/(nx/2); Yc=(yy-cy)/(ny/2)
+        return np.sqrt(Xc**2+Yc**2)+1e-6
+    elif name=="radial-center":
+        X0=(xx-nx/2)/(nx/2); Y0=(yy-ny/2)/(ny/2)
+        return np.sqrt(X0**2+Y0**2)+1e-6
+    else:
+        raise ValueError("Use 'radial-from-peak' or 'radial-center'")
+
+# --- morphology helpers（同分位 + 去小斑块） ---
+def binarize_by_quantile(arr, q=0.90):
+    thr = np.quantile(arr, q); return (arr >= thr), thr
+
+def perimeter_length(binary):
+    er = binary_erosion(binary); edge = binary ^ er
+    return float(edge.sum())
+
+def component_keep_mask(binary, min_size=50):
+    lab, n = label(binary)
+    keep = np.zeros_like(binary, bool); sizes=[]
+    if n>0:
+        sls=find_objects(lab)
+        for i,sl in enumerate(sls, start=1):
+            if sl is None: continue
+            mask=(lab[sl]==i); sz=int(mask.sum())
+            if sz >= min_size:
+                keep[sl] |= mask; sizes.append(sz)
+    return keep, len(sizes), sizes
+
+def morph_compare(arrA, arrB, q=0.90, min_size=50, mpp=None):
+    bA_raw, thrA = binarize_by_quantile(arrA, q=q)
+    bB_raw, thrB = binarize_by_quantile(arrB, q=q)
+    bA, nA, sizesA = component_keep_mask(bA_raw, min_size=min_size)
+    bB, nB, sizesB = component_keep_mask(bB_raw, min_size=min_size)
+    perA = perimeter_length(bA); perB = perimeter_length(bB)
+    areaA = float(bA.sum()); areaB = float(bB.sum())
+    if mpp is not None:
+        px2=(mpp**2)
+        return dict(q=q, thrA=thrA, thrB=thrB, min_size=min_size,
+                    compA=nA, compB=nB, areaA_px=areaA, areaB_px=areaB,
+                    areaA_mpc2=areaA*px2, areaB_mpc2=areaB*px2,
+                    perA_px=perA, perB_px=perB, perA_mpc=perA*mpp, perB_mpc=perB*mpp)
+    else:
+        return dict(q=q, thrA=thrA, thrB=thrB, min_size=min_size,
+                    compA=nA, compB=nB, areaA_px=areaA, areaB_px=areaB,
+                    perA_px=perA, perB_px=perB)
+
+# ------------ Core runner ------------
+def run_one(name, url, CFG):
+    # load κ
+    with fits.open(url) as hdul:
+        data = hdul[0].data if hdul[0].data is not None else hdul[1].data
+        kappa = np.array(data, dtype=np.float64)
+    # resize / preprocess
+    if kappa.shape != (CFG["TARGET_N"], CFG["TARGET_N"]):
+        zy=CFG["TARGET_N"]/kappa.shape[0]; zx=CFG["TARGET_N"]/kappa.shape[1]
+        kappa = zoom(kappa, (zy, zx), order=1)
+    kappa = np.nan_to_num(kappa, nan=0.0, posinf=0.0, neginf=0.0)
+    if CFG["SIGMA_SMOOTH_DATA"]>0: kappa = gaussian_filter(kappa, CFG["SIGMA_SMOOTH_DATA"])
+    kappa = zscore(kappa)
+
+    ny,nx=kappa.shape; yy,xx=np.mgrid[0:ny,0:nx]
+    W2D = tukey2d(kappa.shape, alpha=CFG["TUKEY_ALPHA"])
+    BP_MASK = bandpass_mask(kappa.shape, *CFG["BANDPASS"])
+
+    # U -> θ -> κ_pred
+    U      = embedding_field(CFG["EMBEDDING"], xx, yy, kappa)
+    theta  = theta_exact_from_U(U, t_lo=CFG["T_LO"], t_hi=CFG["T_HI"], GRID_N=CFG["THETA_GRID_N"], mp_dps=50)
+    theta_bp = bandpass_apply(theta * W2D, BP_MASK)
+
+    # data/pred: window -> (pred 轻平滑) -> (两者一起带通) -> (pred 再轻抑碎) -> zscore
+    kappa_w   = kappa * W2D
+    kpred0    = -laplacian_2d(theta_bp)
+    if CFG["SIGMA_SMOOTH_PRED"]>0: kpred0 = gaussian_filter(kpred0, CFG["SIGMA_SMOOTH_PRED"])
+    # 带通
+    kappa_bp  = bandpass_apply(kappa_w, BP_MASK)
+    kpred_bp  = bandpass_apply(kpred0,  BP_MASK)
+    # 预测再轻抑碎
+    kpred_bp  = gaussian_filter(kpred_bp, 1.0)
+    kappa_bp  = zscore(kappa_bp); kpred_bp = zscore(kpred_bp)
+
+    # controls（同口径）
+    def shuffle_phase(f, seed=0):
+        F = spfft.fft2(f); A = np.abs(F)
+        rng=np.random.default_rng(seed); phase = np.exp(1j*2*np.pi*rng.random(f.shape))
+        return spfft.ifft2(A*phase).real
+
+    # phase-shuffle on θ_bp → kpred_sh
+    theta_bp_sh = shuffle_phase(theta_bp, seed=42)
+    kpred_sh  = -laplacian_2d(theta_bp_sh)
+    kpred_sh  = gaussian_filter(kpred_sh, CFG["SIGMA_SMOOTH_PRED"])
+    kpred_sh  = bandpass_apply(kpred_sh, BP_MASK)
+    kpred_sh  = gaussian_filter(kpred_sh, 1.0)
+    kpred_sh  = zscore(kpred_sh)
+
+    # U-roll / U-rot90 → θ → 带通 → pred 同流程
+    U_roll = np.roll(np.roll(U,64,0),64,1); U_rot=np.rot90(U,1)
+    th_roll = theta_exact_from_U(U_roll, CFG["T_LO"], CFG["T_HI"], CFG["THETA_GRID_N"], mp_dps=50)
+    th_rot  = theta_exact_from_U(U_rot,  CFG["T_LO"], CFG["T_HI"], CFG["THETA_GRID_N"], mp_dps=50)
+    th_roll_bp = bandpass_apply(th_roll*W2D, BP_MASK); th_rot_bp = bandpass_apply(th_rot*W2D, BP_MASK)
+    kpred_roll = gaussian_filter(-laplacian_2d(th_roll_bp), CFG["SIGMA_SMOOTH_PRED"])
+    kpred_rot  = gaussian_filter(-laplacian_2d(th_rot_bp),  CFG["SIGMA_SMOOTH_PRED"])
+    kpred_roll = bandpass_apply(kpred_roll, BP_MASK); kpred_rot = bandpass_apply(kpred_rot, BP_MASK)
+    kpred_roll = gaussian_filter(kpred_roll, 1.0)
+    kpred_rot  = gaussian_filter(kpred_rot,  1.0)
+    kpred_roll = zscore(kpred_roll); kpred_rot = zscore(kpred_rot)
+
+    # ---- metrics：在同带宽内 detrend + LoG 峰 + best-shift + F1（BEST 只在对齐后算）----
+    from scipy.ndimage import gaussian_filter as gf
+    def metrics_bp(kd_bp, kp_bp):
+        kd2 = kd_bp - gf(kd_bp, 6)
+        kp2 = kp_bp - gf(kp_bp, 6)
+        r,_=pearsonr(kd2.ravel(), kp2.ravel())
+        gbar,g2,common=mean_gamma2(kd2,kp2, lohi=CFG["SLOPE_FIT_FRAC"])
+        gbar_jk,(glo,ghi)=jackknife_gamma2(g2,common, lohi=CFG["SLOPE_FIT_FRAC"], blocks=10)
+        peaks_d = peaks_multiscale(kd2, N=PRIMARY["TOP_N_PEAKS"], min_sep=PRIMARY["PEAK_MIN_SEP"])
+        peaks_p = peaks_multiscale(kp2, N=PRIMARY["TOP_N_PEAKS"], min_sep=PRIMARY["PEAK_MIN_SEP"])
+        pmr = match_rate(peaks_d, peaks_p, r_pix=PRIMARY["PEAK_MATCH_RADIUS"])  # 旧简易指标
+        r_best,(dy,dx)=best_shift_corr(kd2,kp2, max_shift=CFG["BEST_SHIFT_MAX"])
+        return dict(r=r, r_best=r_best, shift=(dy,dx), gamma2=gbar, gamma2_jk=(gbar_jk,glo,ghi),
+                    peak=pmr, kd2=kd2, kp2=kp2, peaks_d=peaks_d, peaks_p=peaks_p)
+
+    M_best=metrics_bp(kappa_bp,kpred_bp);  M_shuf=metrics_bp(kappa_bp,kpred_sh)
+    M_roll=metrics_bp(kappa_bp,kpred_roll); M_rot =metrics_bp(kappa_bp,kpred_rot)
+
+    # BEST：best-shift 对齐后的一对一 F1
+    dy, dx = M_best["shift"]
+    kp2_aligned = np.roll(np.roll(M_best["kp2"], dy, axis=0), dx, axis=1)
+    peaks_p_al  = peaks_multiscale(kp2_aligned, N=PRIMARY["TOP_N_PEAKS"], min_sep=PRIMARY["PEAK_MIN_SEP"])
+    F1_aligned  = f1_hungarian(M_best["peaks_d"], peaks_p_al, R=PRIMARY["PEAK_MATCH_RADIUS"])
+
+    # 控制组：F1（不做 best-shift，严格）
+    F1_sh = f1_hungarian(M_shuf["peaks_d"], M_shuf["peaks_p"], R=PRIMARY["PEAK_MATCH_RADIUS"])
+    F1_ro = f1_hungarian(M_roll["peaks_d"], M_roll["peaks_p"], R=PRIMARY["PEAK_MATCH_RADIUS"])
+    F1_rt = f1_hungarian(M_rot["peaks_d"],  M_rot["peaks_p"],  R=PRIMARY["PEAK_MATCH_RADIUS"])
+
+    # morphology：同带宽内、同分位阈值、去小斑块
+    morph = morph_compare(kappa_bp, kpred_bp, q=PRIMARY["MORPH_Q"], min_size=PRIMARY["MORPH_MIN_SIZE"], mpp=PRIMARY["MPP"])
+
+    # spectra（θ_bp vs kpred_bp）
+    def fit_slope(k,P, lo=0.08,hi=0.30):
+        n=len(k); i0=int(n*lo); i1=int(n*hi)
+        kk=k[i0:i1].astype(float); pp=P[i0:i1].astype(float)
+        return float(np.polyfit(np.log(kk+1e-9), np.log(pp+1e-12), 1)[0])
+    kt,Pt=isotropic_ps(zscore(theta_bp)); kp,Pp=isotropic_ps(kpred_bp)
+    s_theta=fit_slope(kt,Pt,*PRIMARY["SLOPE_FIT_FRAC"]); s_pred=fit_slope(kp,Pp,*PRIMARY["SLOPE_FIT_FRAC"])
+
+    # plots（简要）
+    plt.figure(figsize=(5.8,4.8)); plt.imshow(kappa_bp, origin='lower'); plt.colorbar(); plt.title(f"{name}: κ (bandpassed,z)"); plt.tight_layout(); plt.show()
+    plt.figure(figsize=(5.8,4.8)); plt.imshow(kpred_bp, origin='lower'); plt.colorbar(); plt.title("κ_pred ∝ −∇²θ(U) (bandpassed,z)"); plt.tight_layout(); plt.show()
+    plt.figure(figsize=(5.8,4.8)); plt.loglog(kt,Pt,label="P_theta"); plt.loglog(kp,Pp,label="P_kappa_pred"); plt.legend(); plt.title("Isotropic power spectra"); plt.tight_layout(); plt.show()
+
+    # coherence curves
+    kd,Pd=isotropic_ps(kappa_bp); kp2,Pp2=isotropic_ps(kpred_bp); kx,Px=isotropic_cross_ps(kappa_bp,kpred_bp)
+    c=min(len(Pd),len(Pp2),len(Px)); Pd,Pp2,Px=Pd[:c],Pp2[:c],Px[:c]
+    g2_curve=(Px**2)/(np.maximum(Pd,1e-20)*np.maximum(Pp2,1e-20))
+    kd,Pd=isotropic_ps(kappa_bp); kp3,Pp3=isotropic_ps(kpred_sh); kx,Px=isotropic_cross_ps(kappa_bp,kpred_sh)
+    c2=min(len(Pd),len(Pp3),len(Px)); Pd,Pp3,Px=Pd[:c2],Pp3[:c2],Px[:c2]
+    g2_sh_curve=(Px**2)/(np.maximum(Pd,1e-20)*np.maximum(Pp3,1e-20))
+    plt.figure(figsize=(5.8,4.8)); plt.semilogy(np.arange(len(g2_curve)), g2_curve, label="γ²(data×pred)")
+    plt.semilogy(np.arange(len(g2_sh_curve)), g2_sh_curve, label="γ²(shuffled)")
+    plt.legend(); plt.title("Coherence vs k"); plt.tight_layout(); plt.show()
+
+    # 判据（F1_aligned 与控制 F1 对比）
+    def pf(real, ctrl_max, min_th): return (real >= min_th) and (real > max(ctrl_max,1e-9)*1.5)
+    ok_gamma = pf(M_best["gamma2"], max(M_shuf["gamma2"],M_roll["gamma2"],M_rot["gamma2"]), THRESH["gamma2_min"])
+    ctrl_F1_max = max(F1_sh, F1_ro, F1_rt)
+    ok_f1   = pf(F1_aligned, ctrl_F1_max, THRESH["f1_min"])
+    bonus_r = (M_best["r_best"] >= THRESH["r_bonus"])
+
+    # 输出
+    print("\n=== PRIMARY (locked, minimal integrated changes) ===")
+    print(f"Dataset: {name}")
+    print(f"Embed={PRIMARY['EMBEDDING']}  band={PRIMARY['BANDPASS']}  θgrid={PRIMARY['THETA_GRID_N']}"
+          f"  smooth(data,pred)=({PRIMARY['SIGMA_SMOOTH_DATA']},{PRIMARY['SIGMA_SMOOTH_PRED']})")
+    print(f"[BEST]     r={M_best['r']:+.3f}, r_best={M_best['r_best']:+.3f}@{M_best['shift']}, γ̄²={M_best['gamma2']:.3f} "
+          f"[JK {M_best['gamma2_jk'][0]:.3f} CI {M_best['gamma2_jk'][1]:.3f},{M_best['gamma2_jk'][2]:.3f}], "
+          f"peak(raw)={M_best['peak']:.3f}")
+    print(f"[BEST-aligned] F1(one-to-one) = {F1_aligned:.3f}")
+    print(f"[CTRL]  γ̄²: shuffle={M_shuf['gamma2']:.3f} roll={M_roll['gamma2']:.3f} rot90={M_rot['gamma2']:.3f}")
+    print(f"[CTRL]  F1 : shuffle={F1_sh:.3f} roll={F1_ro:.3f} rot90={F1_rt:.3f}")
+    print(f"[Sanity] slope(P_theta)={s_theta:.2f}, slope(P_pred)={s_pred:.2f}, diff={s_pred-s_theta:.2f}")
+    print(f"[Morph @q={PRIMARY['MORPH_Q']:.2f}, min_size={PRIMARY['MORPH_MIN_SIZE']}] "
+          f"comps: data={morph['compA']} pred={morph['compB']}; "
+          f"area(px): data={morph['areaA_px']:.0f} pred={morph['areaB_px']:.0f}; "
+          f"perim(px): data={morph['perA_px']:.0f} pred={morph['perB_px']:.0f}")
+    if PRIMARY['MPP'] is not None:
+        print(f"          area(Mpc^2): data={morph['areaA_mpc2']:.2f} pred={morph['areaB_mpc2']:.2f}; "
+              f"perim(Mpc): data={morph['perA_mpc']:.2f} pred={morph['perB_mpc']:.2f}")
+
+    print(f"\nPASS: γ̄²≥{THRESH['gamma2_min']}? {ok_gamma} | F1(aligned)≥{THRESH['f1_min']} & ≥1.5×ctrl? {ok_f1} | bonus r_best≥{THRESH['r_bonus']}? {bonus_r}")
+    print("Done.\n")
+    return dict(metrics=(M_best,M_shuf,M_roll,M_rot), morph=morph,
+                F1_best=F1_aligned, F1_ctrl=(F1_sh,F1_ro,F1_rt))
+
+# ----------- RUN: A2744（以及可选第二天区不改参复现） -----------
+print(">>> Running A2744 with locked params ...")
+_ = run_one("Abell2744_CATSv4", A2744_URL, PRIMARY)
+
+if SECOND_URL.strip():
+    print(">>> Running SECOND dataset with the SAME params (replication) ...")
+    _ = run_one("SECOND", SECOND_URL.strip(), PRIMARY)
+else:
+    print("Tip: paste SECOND_URL (e.g., MACS J0416 / A370 CATS v4 κ FITS) and rerun this cell to perform a no-param-change replication.")
 
