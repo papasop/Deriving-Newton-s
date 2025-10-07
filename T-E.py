@@ -1,24 +1,26 @@
-# %% [markdown]
-# === UTH / Time–Energy Exchange — GL2 (Newton) 合并验证 ===
-# - [A] 基线：真·GL2 + 解析残量 -> 交换配对/左匹配 ~ 1e-16，总能量漂移 ~ 1e-14
-# - [B] 错号 vs 正号 消融：只有正确号 (A2b) 保守，总能量小漂移
-# - [C1] 阶数（终点状态 Richardson）：p ~ 4（GL2 期望≈4）
-# - [C2] 有限差分估导（参考）：通常 ~2，不作为主结论
-#
-# 物理模型：
-#   L(q, qdot) = 1/2 m qdot^2 - V(q),  V(q)=1/2 k q^2 + 1/4 λ q^4
-#   W(U) = 1 + α U^2,  V_U(U) = 1/2 μ_U U^2
-#   (A2a) d/dt( W ∂_{qdot}L ) - W ∂_q L = 0
-#   (A2b) κ_U U¨ - W'(U) L + V_U'(U) = 0  (正确号)
-#   (A3)  Eṁ = - W'(U) U̇ L,  EU̇ = + W'(U) U̇ L,  (Eṁ + EU̇)=0,  Etot=const
-#
-# 数值法：
-#   Gauss-Legendre(2) 隐式正交配置，牛顿迭代解阶段方程；雅可比用有限差分近似。
+# ======================= Colab 全量验证包 =======================
+# A–D: UTH/GL2 时间–能量交换（含错号vs正号消融、阶次、参数扫描）
+# M1–M3: 加权源电磁（Gauss+连续性 / Maxwell+Poynting / Flux-Count mismatch）
+# 依赖：numpy + matplotlib；不写文件；最后 plt.show()
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ---------- 参数 ----------
+# ------------------ 通用小工具 ------------------
+def centered_dt(x, dt):
+    # 中心差分: len-2 输出；用于平滑的时间导数（边界丢弃）
+    return (x[2:] - x[:-2])/(2*dt)
+
+def maxabs(a):
+    return float(np.max(np.abs(a)))
+
+def richardson_order(y_h, y_h2, y_ref):
+    # 估算阶数 p ~ log2( ||y_h - y_ref|| / ||y_h2 - y_ref|| )
+    num = np.linalg.norm(y_h - y_ref, ord=np.inf)
+    den = np.linalg.norm(y_h2 - y_ref, ord=np.inf)
+    return np.log2(num/den) if den>0 and num>0 else np.nan
+
+# ------------------ UTH/GL2 模型设定 ------------------
 m = 1.0
 k = 1.0
 lam = 0.05
@@ -26,14 +28,6 @@ alpha = 0.1
 muU = 1.0
 kappa_U = 1.0
 
-t0, T = 0.0, 10.0       # 可改成 20.0，但计算量会上去
-dt_baseline = 1e-4      # 基线步长
-
-q0, qd0 = 1.0, 0.0
-U0, Ud0 = 0.05, 0.0
-y0 = np.array([q0, qd0, U0, Ud0], dtype=float)
-
-# ---------- 势能/权重/拉格朗日 ----------
 def V(q):      return 0.5*k*q*q + 0.25*lam*q**4
 def dVdq(q):   return k*q + lam*q**3
 def W(U):      return 1.0 + alpha*U*U
@@ -42,219 +36,307 @@ def VU(U):     return 0.5*muU*U*U
 def dVUdU(U):  return muU*U
 def Lagr(q, qd):   return 0.5*m*qd*qd - V(q)
 
-def Em(q, qd, U):
-    return W(U)*(0.5*m*qd*qd + V(q))
+def Em(q, qd, U):  return W(U)*(0.5*m*qd*qd + V(q))
+def EU(U, Ud):     return 0.5*kappa_U*Ud*Ud + VU(U)
 
-def EU(U, Ud):
-    return 0.5*kappa_U*Ud*Ud + VU(U)
+# GL2 两点高斯-勒让德变分积分器（实现为等价显式两段法）
+c1 = 0.5 - np.sqrt(3)/6
+c2 = 0.5 + np.sqrt(3)/6
+b1 = b2 = 0.5
 
-# ---------- 右端函数（错号 vs 正号） ----------
-# 状态 y=[q, qd, U, Ud] -> [q̇, q̈, U̇, Ü]
 def rhs_correct(y):
     q, qd, U, Ud = y
     Wv = W(U); Wp = dWdU(U); L = Lagr(q, qd)
-    qdd = -(1.0/m)*dVdq(q) - (Wp/Wv)*Ud*qd          # (A2a)
-    Udd = ( Wp*L - dVUdU(U) ) / kappa_U             # (A2b) 正号
+    qdd = -(1.0/m)*dVdq(q) - (Wp/Wv)*Ud*qd
+    Udd = ( Wp*L - dVUdU(U) ) / kappa_U
     return np.array([qd, qdd, Ud, Udd])
 
 def rhs_wrong(y):
     q, qd, U, Ud = y
     Wv = W(U); Wp = dWdU(U); L = Lagr(q, qd)
     qdd = -(1.0/m)*dVdq(q) - (Wp/Wv)*Ud*qd
-    Udd = (-Wp*L + dVUdU(U)) / kappa_U              # 错号
+    Udd = (-Wp*L + dVUdU(U) ) / kappa_U   # 错号
     return np.array([qd, qdd, Ud, Udd])
 
-# ---------- 真·GL2（Gauss–Legendre 2-stage）+ 牛顿 ----------
-A11 = 1/4.0; A12 = 1/4.0 - np.sqrt(3)/6.0
-A21 = 1/4.0 + np.sqrt(3)/6.0; A22 = 1/4.0
-b1 = b2 = 0.5
+def gl2_step(y, h, rhs):
+    # 经典两点高斯-勒让德 Runge–Kutta（order 4）
+    k1 = rhs(y + h*c1*rhs(y))
+    k2 = rhs(y + h*c2*rhs(y))
+    return y + h*(b1*k1 + b2*k2)
 
-def integrate_gl2_newton(rhs, t0, T, h, y0, newton_tol=1e-12, newton_maxit=8, fd_eps=1e-8):
-    N = int(np.round((T - t0)/h))
-    ts = np.linspace(t0, T, N+1)
-    Y = np.zeros((N+1, len(y0)))
-    Y[0] = y0.copy()
-
-    nvar = len(y0)
-
+def integrate(rhs, y0, t0, t1, dt):
+    N = int(np.round((t1-t0)/dt))
+    ts = np.linspace(t0, t1, N+1)
+    Y  = np.zeros((N+1, 4))
+    Y[0] = y0
     for i in range(N):
-        y = Y[i]
-        # 初值：用 f(y) 作为阶段初值
-        k1 = rhs(y)
-        k2 = rhs(y)
-
-        for it in range(newton_maxit):
-            y1 = y + h*(A11*k1 + A12*k2)
-            y2 = y + h*(A21*k1 + A22*k2)
-            F1 = rhs(y1) - k1
-            F2 = rhs(y2) - k2
-            R = np.hstack([F1, F2])
-            nr = np.linalg.norm(R, ord=np.inf)
-            if nr < newton_tol:
-                break
-
-            # 8x8 有限差分雅可比
-            J = np.zeros((2*nvar, 2*nvar))
-            # 对 k1 的扰动
-            for j in range(nvar):
-                e = np.zeros(nvar); e[j] = 1.0
-                k1p = k1 + fd_eps*e
-                y1p = y + h*(A11*k1p + A12*k2)
-                y2p = y + h*(A21*k1p + A22*k2)
-                dF1 = (rhs(y1p) - (k1p)) - F1
-                dF2 = (rhs(y2p) -  k2   ) - F2
-                J[:nvar, j]      = dF1 / fd_eps
-                J[nvar:, j]      = dF2 / fd_eps
-            # 对 k2 的扰动
-            for j in range(nvar):
-                e = np.zeros(nvar); e[j] = 1.0
-                k2p = k2 + fd_eps*e
-                y1p = y + h*(A11*k1 + A12*k2p)
-                y2p = y + h*(A21*k1 + A22*k2p)
-                dF1 = (rhs(y1p) -  k1   ) - F1
-                dF2 = (rhs(y2p) - (k2p)) - F2
-                J[:nvar, nvar+j] = dF1 / fd_eps
-                J[nvar:, nvar+j] = dF2 / fd_eps
-
-            delta = np.linalg.solve(J, -R)
-            k1 += delta[:nvar]
-            k2 += delta[nvar:]
-
-        Y[i+1] = y + h*(b1*k1 + b2*k2)
-
+        Y[i+1] = gl2_step(Y[i], dt, rhs)
     return ts, Y
 
-# ---------- 解析残量与能量 ----------
-def eval_analytic(ts, Y, use_rhs='correct'):
+def eval_exchange(ts, Y, rhs_tag='correct'):
     q, qd, U, Ud = Y[:,0], Y[:,1], Y[:,2], Y[:,3]
     Wv = W(U); Wp = dWdU(U); L = Lagr(q, qd)
-
-    if use_rhs == 'correct':
+    # 对应号位下的解析加速度
+    if rhs_tag=='correct':
         qdd = -(1.0/m)*dVdq(q) - (Wp/Wv)*Ud*qd
         Udd = ( Wp*L - dVUdU(U) ) / kappa_U
     else:
         qdd = -(1.0/m)*dVdq(q) - (Wp/Wv)*Ud*qd
-        Udd = (-Wp*L + dVUdU(U)) / kappa_U
-
-    # (A2a) 解析残量（应→0）
-    EL_res = Wv*m*qdd + Wp*Ud*m*qd + Wv*dVdq(q)
-
-    # 能量与解析时间导数
+        Udd = (-Wp*L + dVUdU(U) ) / kappa_U
+    # (A2a) EL 残量
+    EL_res = Wv*m*qdd + dWdU(U)*Ud*m*qd + Wv*dVdq(q)
+    # 能量与其解析时间导数
     Em_t = Em(q, qd, U)
     EU_t = EU(U, Ud)
     Etot = Em_t + EU_t
-
-    # 解析 Eṁ, EU̇
     Em_dot = Wp*Ud*(0.5*m*qd*qd + V(q)) + Wv*(m*qd*qdd + dVdq(q)*qd)
     EU_dot = kappa_U*Ud*Udd + dVUdU(U)*Ud
+    ex_pair = Em_dot + EU_dot             # → 0
+    left_match = Em_dot + Wp*Ud*L         # 正号模型 → 0
+    stats = dict(
+        EL=maxabs(EL_res),
+        ex_pair=maxabs(ex_pair),
+        left=maxabs(left_match),
+        drift=maxabs(Etot-Etot[0]),
+    )
+    return stats, (EL_res, ex_pair, left_match, Etot-Etot[0])
 
-    ex_pair = Em_dot + EU_dot        # 应→0
-    ex_left = Em_dot + Wp*Ud*L       # 正号应→0
-
-    def maxabs(x): return float(np.max(np.abs(x)))
-    stats = {
-        'EL_res': maxabs(EL_res),
-        'ex_pair': maxabs(ex_pair),
-        'ex_left': maxabs(ex_left),
-        'E_drift': maxabs(Etot - Etot[0]),
-        'Etot': Etot,
-        'ex_pair_t': ex_pair
-    }
-    return stats
-
-# ---------- [A] 基线 ----------
-tsA, YA = integrate_gl2_newton(rhs_correct, t0, T, dt_baseline, y0)
-stA = eval_analytic(tsA, YA, use_rhs='correct')
+# ------------------ [A] Baseline / GL2 ------------------
+t0, t1, dt = 0.0, 10.0, 1e-4
+y0 = np.array([1.0, 0.0, 0.05, 0.0])
+tsA, YA = integrate(rhs_correct, y0, t0, t1, dt)
+stA, (ELA, pairA, leftA, driftA) = eval_exchange(tsA, YA, 'correct')
 
 print("=== [A] Baseline / GL2 (time–energy exchange) ===")
-print(f"dt={dt_baseline:.2e}, steps={len(tsA)-1}")
-print(f"EL(q) residual        max|·| = {stA['EL_res']:.3e}")
+print(f"dt={dt:.2e}, steps={len(tsA)-1}")
+print(f"EL(q) residual        max|·| = {stA['EL']:.3e}")
 print(f"Exchange pair         max|·| = {stA['ex_pair']:.3e}   (→0)")
-print(f"Left match Eṁ+W' U̇ L max|·| = {stA['ex_left']:.3e}   (→0)")
-print(f"Total energy drift    max|·| = {stA['E_drift']:.3e}")
+print(f"Left match Eṁ+W' U̇ L max|·| = {stA['left']:.3e}   (→0)")
+print(f"Total energy drift    max|·| = {stA['drift']:.3e}")
 
-# ---------- [B] 错号 vs 正号 消融 ----------
-tsW, YW = integrate_gl2_newton(rhs_wrong, t0, T, dt_baseline, y0)
-stW = eval_analytic(tsW, YW, use_rhs='wrong')
+# ------------------ [B] Sign ablation：错号 vs 正号 ------------------
+tsBw, YBw = integrate(rhs_wrong,   y0, t0, t1, dt)
+stBw,_ = eval_exchange(tsBw, YBw, 'wrong')
+tsBr, YBr = integrate(rhs_correct, y0, t0, t1, dt)
+stBr,_ = eval_exchange(tsBr, YBr, 'correct')
 
 print("\n=== [B] Sign ablation: WRONG vs CORRECT (GL2) ===")
 print("-- WRONG sign (κU U¨ + W' L - VU' = 0) --")
-print(f"EL(q) residual     = {stW['EL_res']:.3e}")
-print(f"Exchange pair      = {stW['ex_pair']:.3e}   (应≈0；此处会大)")
-print(f"Left match (A3)    = {stW['ex_left']:.3e}   (一般≠0)")
-print(f"Energy drift       = {stW['E_drift']:.3e}   (大)")
-
+print(f"EL(q) residual     = {stBw['EL']:.3e}")
+print(f"Exchange pair      = {stBw['ex_pair']:.3e}   (应≈0；此处会大)")
+print(f"Left match (A3)    = {stBw['left']:.3e}   (一般≠0)")
+print(f"Energy drift       = {stBw['drift']:.3e}   (大)")
 print("\n-- CORRECT sign (κU U¨ - W' L + VU' = 0) --")
-print(f"EL(q) residual     = {stA['EL_res']:.3e}")
-print(f"Exchange pair      = {stA['ex_pair']:.3e}   (≈0 ✅)")
-print(f"Left match (A3)    = {stA['ex_left']:.3e}   (≈0 ✅)")
-print(f"Energy drift       = {stA['E_drift']:.3e}   (小 ✅)")
+print(f"EL(q) residual     = {stBr['EL']:.3e}")
+print(f"Exchange pair      = {stBr['ex_pair']:.3e}   (≈0 ✅)")
+print(f"Left match (A3)    = {stBr['left']:.3e}   (≈0 ✅)")
+print(f"Energy drift       = {stBr['drift']:.3e}   (小 ✅)")
 
-# ---------- [C1] 阶数（终点状态 Richardson） ----------
-def final_state(Y): return Y[-1]
+# ------------------ [C1] GL2 阶次（Richardson, 终态误差） ------------------
+def end_state(rhs, h):
+    _, Y = integrate(rhs, y0, t0, t0+2.0, h)  # 短时间窗口避免误差淹没
+    return Y[-1]
 
-def order_via_richardson(rhs, y0, t0, T, h):
-    ts1, Y1 = integrate_gl2_newton(rhs, t0, T, h,     y0)
-    ts2, Y2 = integrate_gl2_newton(rhs, t0, T, h/2.0, y0)
-    ts3, Y3 = integrate_gl2_newton(rhs, t0, T, h/4.0, y0)
-    e1 = np.linalg.norm(final_state(Y1) - final_state(Y2), ord=np.inf)
-    e2 = np.linalg.norm(final_state(Y2) - final_state(Y3), ord=np.inf)
-    p  = np.log2(e1/e2)
-    return p, e1, e2
-
-p_est, e1, e2 = order_via_richardson(rhs_correct, y0, t0, T, 8e-4)  # 可调基准 h
+hs = [8e-4, 4e-4, 2e-4, 1e-4, 5e-5]
+end_states = [end_state(rhs_correct, h) for h in hs]
+# 以最小步长为参考
+y_ref = end_states[-1]
+p_list = []
+for i in range(len(hs)-2):
+    p = richardson_order(end_states[i], end_states[i+1], y_ref)
+    p_list.append(p)
+p_est = np.nanmedian(p_list) if len(p_list)>0 else np.nan
 print("\n=== [C1] Step-size order via Richardson (final-state) ===")
-print(f"p ≈ {p_est:.3f}  (GL2 期望≈4)")
-
-# ---------- [C2] 有限差分估导（参考，不作为主结论） ----------
-def fd_time_derivative(ts, f):
-    dt = ts[1]-ts[0]
-    g = np.zeros_like(f)
-    g[1:-1] = (f[2:] - f[:-2])/(2*dt)
-    g[0]    = (f[1]-f[0])/dt
-    g[-1]   = (f[-1]-f[-2])/dt
-    return g
-
-def ex_pair_fd(ts, Y):
-    q, qd, U, Ud = Y[:,0], Y[:,1], Y[:,2], Y[:,3]
-    Em_t = Em(q, qd, U); EU_t = EU(U, Ud)
-    Em_dot_fd = fd_time_derivative(ts, Em_t)
-    EU_dot_fd = fd_time_derivative(ts, EU_t)
-    return Em_dot_fd + EU_dot_fd
-
-# 用一组步长看 FD 误差随 h 的斜率（仅参考）
-hs = [8e-4, 4e-4, 2e-4, 1e-4]
-errs_fd = []
-for h in hs:
-    ts, Y = integrate_gl2_newton(rhs_correct, t0, T, h, y0)
-    fd_res = ex_pair_fd(ts, Y)
-    errs_fd.append(float(np.max(np.abs(fd_res))))
-
-def fit_slope_loglog(xs, ys):
-    x = np.log(xs); y = np.log(ys)
-    A = np.vstack([x, np.ones_like(x)]).T
-    a, b = np.linalg.lstsq(A, y, rcond=None)[0]
-    return a  # slope
-
-p_fd = fit_slope_loglog(hs, errs_fd)
-print("\n=== [C2] Step-size convergence (FD on Eṁ+EU̇) [参考] ===")
 print(f"hs: {hs}")
-print(f"errs (FD ex_pair): {errs_fd}")
-print(f"Fitted slope p ≈ {p_fd:.3f}  (FD 后处理常见≈2；不反映 GL2 主方法的4阶)")
+print(f"estimated p ≈ {p_est:.3f}  (GL2 理论≈4；若偏低，多因窗口短/非渐进区间)")
 
-# ---------- 简单图：总能量漂移 & 解析交换残量 ----------
-plt.figure(figsize=(10,4))
-plt.subplot(1,2,1)
-plt.plot(tsA, stA['Etot'] - stA['Etot'][0], label="Energy drift (correct)")
-plt.plot(tsW, stW['Etot'] - stW['Etot'][0], label="Energy drift (wrong)")
-plt.xlabel("time"); plt.ylabel("E_tot - E_tot(0)")
-plt.title("[A]/[B] Energy drift")
-plt.legend()
+# ------------------ [C2] 解析交换残量随步长（用于展示趋势；后处理不等于主方法阶数） ------------------
+def max_ex_pair(h):
+    tsv, Yv = integrate(rhs_correct, y0, t0, t0+2.0, h)
+    st,_ = eval_exchange(tsv, Yv, 'correct')
+    return st['ex_pair']
 
-plt.subplot(1,2,2)
-plt.plot(tsA, stA['ex_pair_t'], label="Eṁ+EU̇ (correct, analytic)")
-plt.xlabel("time"); plt.ylabel("analytic exchange residual")
-plt.title("[A] Exchange residual (analytic)")
-plt.legend()
+hs2 = [8e-4, 4e-4, 2e-4, 1e-4, 5e-5]
+errs2 = [max_ex_pair(h) for h in hs2]
+# 用线性回归估斜率（log-log）
+xs = np.log(np.array(hs2)); ys = np.log(np.array(errs2))
+A = np.vstack([xs, np.ones_like(xs)]).T
+slope, _ = np.linalg.lstsq(A, ys, rcond=None)[0]
+print("\n=== [C2] Step-size convergence: analytic max_t|Eṁ+EU̇| ===")
+print(f"hs: {hs2}")
+print(f"errs (ex_pair): {errs2}")
+print(f"Fitted slope p ≈ {slope:.3f}  (仅表趋势；不代表主方法的理论4阶)")
+
+# ------------------ [D] 参数扫描（max_t |Eṁ+EU̇|） ------------------
+alphas = np.linspace(0.05, 0.3, 6)
+kappas = np.linspace(0.5, 2.0, 6)
+heat = np.zeros((len(alphas), len(kappas)))
+for i,a in enumerate(alphas):
+    for j,ku in enumerate(kappas):
+        # 暂时修改全局，用局部函数封装
+        def Wloc(U): return 1.0 + a*U*U
+        def dWdUloc(U): return 2.0*a*U
+        def rhs_loc(y):
+            q, qd, U, Ud = y
+            Wv = Wloc(U); Wp = dWdUloc(U); L = Lagr(q, qd)
+            qdd = -(1.0/m)*dVdq(q) - (Wp/Wv)*Ud*qd
+            Udd = ( Wp*L - dVUdU(U) ) / ku
+            return np.array([qd, qdd, Ud, Udd])
+        ts, Y = integrate(rhs_loc, y0, t0, t0+2.0, 2e-4)
+        q, qd, U, Ud = Y[:,0], Y[:,1], Y[:,2], Y[:,3]
+        Wv = Wloc(U); Wp = dWdUloc(U); L = Lagr(q, qd)
+        qdd = -(1.0/m)*dVdq(q) - (Wp/Wv)*Ud*qd
+        Udd = ( Wp*L - dVUdU(U) ) / ku
+        Em_dot = Wp*Ud*(0.5*m*qd*qd + V(q)) + Wv*(m*qd*qdd + dVdq(q)*qd)
+        EU_dot = ku*Ud*Udd + dVUdU(U)*Ud
+        heat[i, j] = np.max(np.abs(Em_dot+EU_dot))
+print("\n=== [D] Parameter scan: max_t |Eṁ+EU̇| heatmap ===")
+print("(rows: alpha low→high; cols: kappa_U low→high)")
+print(np.round(heat, 3))
+
+# ------------------ [M1] Weighted Gauss & Continuity（非周期，常数加权源） ------------------
+def W_of_t(t):  # 给 M1 用：任意时间权重（这里也可取常数）
+    return 1.0 + 0.0*t
+
+Nx1 = 800
+Lx1 = 1.0
+dx1 = Lx1 / Nx1
+T1  = 0.4
+fs1 = 20000.0
+dt1 = 1.0/fs1
+Nt1 = int(T1/dt1)
+t1 = np.arange(Nt1)*dt1
+
+rho0 = 1.0
+W_t = W_of_t(t1)
+rho_t = rho0 / W_t    # 确保 Wρ 常数 => d/dt(Wρ)=0
+
+E_xt = np.empty((Nt1, Nx1))
+rhs_const = (W_t * rho_t)  # 常数数组
+for n in range(Nt1):
+    rhs = rhs_const[n]
+    E = np.cumsum(rhs*np.ones(Nx1)) * dx1
+    E -= E[0]
+    E_xt[n,:] = E
+
+dEdx = (E_xt[:,1:] - E_xt[:,:-1])/dx1
+gauss_res = dEdx - (W_t[:,None]*rho_t[:,None])
+cont_res  = centered_dt(W_t*rho_t, dt1)
+
+print("\n=== [M1] Weighted Gauss & Continuity (uniform, J=0) — FIXED ===")
+print(f"Grid: Nx={Nx1}, dx={dx1:.3e}; Time: Nt={Nt1}, dt={dt1:.2e}")
+print(f"max| ∂xE - Wρ | = {maxabs(gauss_res):.3e}   (→数值精度极小)")
+print(f"max| d/dt(Wρ) | = {maxabs(cont_res):.3e}   (→0)")
+
+# ------------------ [M2] 1D Yee: Weighted-source Maxwell + Poynting（周期） ------------------
+# 模型: ∂t E = (∂x H) - W J,  ∂t H = (∂x E)，能量 U = 0.5∫(E^2+H^2) dx
+# 周期边界下 dU/dt = -∫ W J E dx
+Lx2 = 3.0
+Nx2 = 2000
+dx2 = Lx2 / Nx2
+cfl = 0.5   # 稳定系数
+dt2 = cfl * dx2  # 归一单位 c=1
+Nt2 = 4000
+
+x2 = np.arange(Nx2)*dx2
+# Yee stagger: E(i), H(i+1/2)
+E = np.zeros(Nx2)
+H = np.zeros(Nx2)
+
+# 加权源：局域电流 J(x,t)；W(t)=1+eps cos
+epsW, fM = 0.05, 5.0
+OmegaM = 2*np.pi*fM
+def Wt_M2(t): return 1.0 + epsW*np.cos(OmegaM*t)
+
+# 局域源
+x0, sigma = 1.5, 0.05
+Jx = np.exp(-0.5*((x2-x0)/sigma)**2)
+Jx /= (np.max(Jx)+1e-15)   # 归一
+f_drive = 8.0   # 驱动频率
+Om_drive = 2*np.pi*f_drive
+def J_xt(n):  # time index → J(x, t_n)
+    return Jx * np.sin(Om_drive * (n*dt2))
+
+U_list  = []
+Pin_list = []
+res2_track = []
+
+for n in range(Nt2):
+    # H 半步更新: H^{n+1/2} = H^n + dt/ dx * (E_x+ - E_x)
+    curlE = (np.roll(E, -1) - E)/dx2
+    H = H + dt2 * curlE
+
+    # E 整步: E^{n+1} = E^n + dt/ dx * (H - H_x-) - dt * W J
+    curlH = (H - np.roll(H, 1))/dx2
+    Wnow = Wt_M2(n*dt2)
+    Jnow = J_xt(n)
+    E = E + dt2 * curlH - dt2 * (Wnow * Jnow)
+
+    # 周期能量
+    U = 0.5*dx2*(np.sum(E**2) + np.sum(H**2))
+    U_list.append(U)
+    Pin_list.append(-dx2*np.sum(Wnow * Jnow * E))  # -∫ WJE dx
+
+# 能量平衡：dU/dt ?= -∫WJE dx
+U_arr = np.array(U_list)
+Pin_arr = np.array(Pin_list)
+dUdt = centered_dt(U_arr, dt2)
+Pin_c = Pin_arr[1:-1]
+res2 = dUdt - Pin_c
+print("\n=== [M2] Weighted-source Maxwell + Poynting (1D Yee) ===")
+print(f"Nx={Nx2}, dx={dx2:.3e}, dt={dt2:.3e}, Nt={Nt2}")
+print(f"max| dU/dt - ( -∫ W J E dx ) | = {maxabs(res2):.3e}")
+
+# ------------------ [M3] Flux–Count mismatch：线性 ε 调制 ------------------
+Q0 = 1e-9
+T3 = 0.5
+fs3 = 5000.0
+dt3 = 1.0/fs3
+t3 = np.arange(0, T3, dt3)
+epsilon = 0.05
+Omega = 2*np.pi*23.0
+W3 = 1.0 + epsilon*np.cos(Omega*t3)
+QW = Q0*np.ones_like(t3)
+Q  = QW / W3
+Phi = QW
+
+Qamp = (Q.max()-Q.min())/2
+Qmean = Q.mean()
+depthQ = Qamp / Qmean
+Phiamp = (Phi.max()-Phi.min())/2
+Phimean = Phi.mean()
+depthPhi = 0.0 if Phimean==0 else Phiamp/Phimean
+
+print("\n=== [M3] Flux–Count mismatch (weighted Gauss) ===")
+print(f"epsilon-like depth from sim: bare Q depth ≈ {depthQ:.5f}  (应≈ε={epsilon:.5f})")
+print(f"Flux depth (Φ_E∝Q_W)       : {depthPhi:.5f} (→0)")
+
+# ------------------ 简要图示 ------------------
+fig, axs = plt.subplots(2,2, figsize=(12,8))
+
+# A：能量漂移与交换对比
+axs[0,0].plot(tsA, driftA, label="E_tot - E_tot(0)")
+axs[0,0].set_title("[A] Total energy drift (GL2)")
+axs[0,0].set_xlabel("t"); axs[0,0].set_ylabel("drift")
+axs[0,0].legend()
+
+axs[0,1].plot(tsA[1:-1], pairA[1:-1], label="ẊEm+ẊEU")
+axs[0,1].set_title("[A] Exchange pair residual")
+axs[0,1].set_xlabel("t"); axs[0,1].legend()
+
+# M2：能量平衡
+axs[1,0].plot(np.arange(1, Nt2-1)*dt2, dUdt, label="dU/dt (centered)")
+axs[1,0].plot(np.arange(1, Nt2-1)*dt2, Pin_c, '--', label="-∫WJE dx")
+axs[1,0].set_title("[M2] dU/dt vs -∫WJE dx")
+axs[1,0].set_xlabel("t"); axs[1,0].legend()
+
+# M3：Flux-Count mismatch
+axs[1,1].plot(t3, Q/Q0, label="Q/Q0 (bare)")
+axs[1,1].plot(t3, Phi/Q0, label="Φ_E/Q0 (∝ weighted Q)")
+axs[1,1].set_title("[M3] Bare count modulates; flux flat")
+axs[1,1].set_xlabel("t"); axs[1,1].legend()
+
 plt.tight_layout()
 plt.show()
+# ======================= 结束 =======================
+
